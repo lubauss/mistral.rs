@@ -57,7 +57,8 @@ impl Processor for Qwen2_5VLProcessor {
     }
 
     fn template_action(&self) -> MessagesAction {
-        MessagesAction::FlattenOnlyText
+        // Must use Keep to preserve image_url in content so chat template can insert vision tokens
+        MessagesAction::Keep
     }
 }
 
