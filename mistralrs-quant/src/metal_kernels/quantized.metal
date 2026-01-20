@@ -2982,10 +2982,18 @@ template <typename T, const int group_size, const int bits>
               instantiate_quantized_all_quad(type, group_size, bits)           \
                   instantiate_quantized_all_splitk(type, group_size, bits)
 
+// Conditionally instantiate bfloat16 only when native bfloat is available
+// macOS Tahoe doesn't support simdgroup_matrix with custom bfloat16 struct
+#if defined(__HAVE_BFLOAT__)
 #define instantiate_quantized_types(group_size, bits)                          \
   instantiate_quantized_funcs(float, group_size, bits)                         \
       instantiate_quantized_funcs(float16_t, group_size, bits)                 \
           instantiate_quantized_funcs(bfloat16_t, group_size, bits)
+#else
+#define instantiate_quantized_types(group_size, bits)                          \
+  instantiate_quantized_funcs(float, group_size, bits)                         \
+      instantiate_quantized_funcs(float16_t, group_size, bits)
+#endif
 
 #define instantiate_quantized_groups(bits)                                     \
   instantiate_quantized_types(128, bits) instantiate_quantized_types(64, bits) \
