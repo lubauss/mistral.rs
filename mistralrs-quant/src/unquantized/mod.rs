@@ -203,6 +203,34 @@ impl QuantMethod for UnquantLinear {
                 // Reshape to [n, k, out]
                 result.reshape((num_tokens, num_experts_per_tok, out_features))
             }
+            // Metal path: 4D intermediate input (b_size, seq_len, num_experts_per_tok, intermediate_dim)
+            // Used for down projection in MoE where input is from gate/up projections
+            &[b_size, seq_len, num_experts_per_tok, intermediate_dim] => {
+                let (_b, _s, indices_k) = indices.dims3()?;
+                assert_eq!(
+                    num_experts_per_tok, indices_k,
+                    "num_experts_per_tok mismatch: input has {} but indices has {}",
+                    num_experts_per_tok, indices_k
+                );
+
+                // Flatten indices to select experts
+                let flat_indices = indices.reshape((b_size * seq_len * num_experts_per_tok,))?;
+
+                // Select expert weights: [b*s*k, out_features, in_features]
+                let selected_w = w.index_select(&flat_indices, 0)?;
+
+                // Reshape input: [b*s*k, intermediate_dim]
+                let a_flat = a.reshape((b_size * seq_len * num_experts_per_tok, intermediate_dim))?;
+
+                // Matmul: [b*s*k, intermediate_dim] @ [b*s*k, intermediate_dim, out_features] -> [b*s*k, out_features]
+                let result = a_flat
+                    .unsqueeze(1)?
+                    .matmul(&selected_w.transpose(1, 2)?)?
+                    .squeeze(1)?;
+
+                // Reshape back to [b, s, k, out_features]
+                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+            }
             dims => {
                 candle_core::bail!(
                     "UnquantLinear::gather_forward: unsupported input shape {:?}",
