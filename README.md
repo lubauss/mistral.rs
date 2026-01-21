@@ -17,6 +17,43 @@ Blazingly fast LLM inference.
   </a>
 </p>
 
+---
+
+## Fork Features (lubauss/mistral.rs)
+
+> This fork adds GGUF vision model support and performance optimizations. [Upstream: EricLBuehler/mistral.rs](https://github.com/EricLBuehler/mistral.rs)
+
+| Feature | Description |
+|---------|-------------|
+| **GGUF Vision Models** | Load pre-quantized vision models with `--mmproj` flag |
+| **1.3x Faster than MLX-VLM** | Optimized vision encoder (83 vs 64 tok/s on M4 Max) |
+| **macOS Tahoe Support** | Metal kernel compatibility for macOS 26.x |
+
+**Quick Start - GGUF Vision:**
+```bash
+# Download model
+huggingface-cli download Qwen/Qwen3-VL-4B-Instruct-GGUF \
+    Qwen3VL-4B-Instruct-Q4_K_M.gguf mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf \
+    --local-dir ./models/qwen3vl-4b
+
+# Run server
+./target/release/mistralrs-server gguf \
+    -m ./models/qwen3vl-4b -f Qwen3VL-4B-Instruct-Q4_K_M.gguf \
+    --mmproj ./models/qwen3vl-4b/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf
+```
+
+<details>
+<summary>Fork Changelog</summary>
+
+- [#4](https://github.com/lubauss/mistral.rs/pull/4) perf(vision): 1.3x speedup over MLX-VLM
+- [#3](https://github.com/lubauss/mistral.rs/pull/3) feat(gguf): GGUF vision model support with mmproj
+- [#2](https://github.com/lubauss/mistral.rs/pull/2) fix(metal): macOS Tahoe compatibility
+- [#1](https://github.com/lubauss/mistral.rs/pull/1) fix(vision/moe): MessagesAction + 4D tensor fixes
+
+</details>
+
+---
+
 **Mistral.rs is a cross-platform, highly-multimodal inference engine that brings you:**
 - All-in-one multimodal workflow: text↔text, text+vision↔text, text+vision+audio↔text, text→speech, text→image, text→embeddings
 - APIs: Rust, Python, OpenAI HTTP server (with Chat Completions, [Responses API compatible with OpenResponses](docs/OPENRESPONSES.md)), MCP server
