@@ -29,6 +29,14 @@ pub enum GGUFArchitecture {
     Qwen2,
     Qwen3,
     Qwen3MoE,
+    // Vision-capable architectures
+    #[strum(serialize = "qwen3vl")]
+    Qwen3Vl,
+    #[strum(serialize = "qwen3vlmoe")]
+    Qwen3VlMoE,
+    // Vision encoder architecture (for mmproj files)
+    #[strum(serialize = "clip")]
+    Clip,
 }
 
 // Wraps from_str() for some convenience:
@@ -39,5 +47,16 @@ impl GGUFArchitecture {
         Self::from_str(&value.as_ref().to_ascii_lowercase())
             .with_context(|| format!("Unknown GGUF architecture `{value}`"))
             .map_err(anyhow::Error::msg)
+    }
+
+    /// Returns true if this architecture supports vision/multimodal inputs.
+    /// Vision architectures require an mmproj file for the vision encoder.
+    pub fn supports_vision(&self) -> bool {
+        matches!(self, Self::Qwen3Vl | Self::Qwen3VlMoE)
+    }
+
+    /// Returns true if this is a vision encoder architecture (for mmproj files).
+    pub fn is_vision_encoder(&self) -> bool {
+        matches!(self, Self::Clip)
     }
 }

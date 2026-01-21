@@ -499,6 +499,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             quantized_model_id,
             quantized_filename,
             topology,
+            mmproj,
             ..
         } => GGUFLoaderBuilder::new(
             args.chat_template,
@@ -510,6 +511,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                mmproj_path: mmproj,
             },
             args.no_kv_cache,
             args.jinja_explicit,
@@ -534,6 +536,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                mmproj_path: None, // XLoraGGUF doesn't support vision yet
             },
             args.no_kv_cache,
             args.jinja_explicit,
@@ -566,6 +569,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                mmproj_path: None, // LoraGGUF doesn't support vision yet
             },
             args.no_kv_cache,
             args.jinja_explicit,

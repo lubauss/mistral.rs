@@ -17,6 +17,8 @@ pub(crate) mod quantized_phi3;
 pub(crate) mod quantized_qwen;
 pub(crate) mod quantized_qwen3;
 pub(crate) mod quantized_qwen3_moe;
+pub(crate) mod quantized_qwen3_vl;
+pub(crate) mod quantized_qwen3_vl_vision;
 pub(crate) mod quantized_starcoder2;
 pub(crate) mod qwen2;
 pub(crate) mod qwen3;

@@ -224,6 +224,7 @@ impl GgufModelBuilder {
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = GGUFSpecificConfig {
             topology: self.topology,
+            mmproj_path: None,
         };
 
         if self.with_logging {
