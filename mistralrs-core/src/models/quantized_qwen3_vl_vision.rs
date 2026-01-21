@@ -25,33 +25,60 @@ use crate::gguf::Content;
 use crate::layers::Sdpa;
 
 /// Simple layer normalization for vision encoder (with bias support).
+/// OPTIMIZED: Pre-converts weights to F32 to avoid per-forward conversions.
 #[derive(Debug, Clone)]
 struct QLayerNorm {
-    weight: Tensor,
-    bias: Option<Tensor>,
+    weight_f32: Tensor,      // Pre-converted to F32
+    bias_f32: Option<Tensor>, // Pre-converted to F32
     eps: f64,
 }
 
 impl QLayerNorm {
     fn new(weight: Tensor, bias: Option<Tensor>, eps: f64) -> Result<Self> {
-        Ok(Self { weight, bias, eps })
+        // Pre-convert weights to F32 during construction (avoids per-forward overhead)
+        let weight_f32 = if weight.dtype() == DType::F32 {
+            weight
+        } else {
+            weight.to_dtype(DType::F32)?
+        };
+        let bias_f32 = bias
+            .map(|b| {
+                if b.dtype() == DType::F32 {
+                    Ok(b)
+                } else {
+                    b.to_dtype(DType::F32)
+                }
+            })
+            .transpose()?;
+        Ok(Self { weight_f32, bias_f32, eps })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let x_dtype = xs.dtype();
-        let xs = xs.to_dtype(DType::F32)?;
+        // Only convert input if not already F32
+        let xs = if x_dtype == DType::F32 {
+            xs.clone()
+        } else {
+            xs.to_dtype(DType::F32)?
+        };
         let hidden_size = xs.dim(D::Minus1)?;
         let mean = (xs.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
         let xs = xs.broadcast_sub(&mean)?;
         let var = ((&xs * &xs)?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
         let xs = xs.broadcast_div(&(var + self.eps)?.sqrt()?)?;
-        let xs = xs.broadcast_mul(&self.weight.to_dtype(DType::F32)?)?;
-        let xs = if let Some(bias) = &self.bias {
-            xs.broadcast_add(&bias.to_dtype(DType::F32)?)?
+        // Weights are already F32, no conversion needed
+        let xs = xs.broadcast_mul(&self.weight_f32)?;
+        let xs = if let Some(bias) = &self.bias_f32 {
+            xs.broadcast_add(bias)?
         } else {
             xs
         };
-        xs.to_dtype(x_dtype)
+        // Convert back to original dtype
+        if x_dtype == DType::F32 {
+            Ok(xs)
+        } else {
+            xs.to_dtype(x_dtype)
+        }
     }
 }
 
@@ -143,25 +170,31 @@ impl QVisionAttention {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        let input_dtype = xs.dtype();
         let seq_len = xs.dim(0)?;
         let hidden_states = self.qkv.forward(xs)?;
 
         let qkv = hidden_states
             .reshape((seq_len, 3, self.num_heads, self.head_dim))?
             .permute((1, 0, 2, 3))?;
-        let mut q = qkv.i(0)?.squeeze(0)?;
-        let mut k = qkv.i(1)?.squeeze(0)?;
-        let mut v = qkv.i(2)?.squeeze(0)?;
+        let q = qkv.i(0)?.squeeze(0)?;
+        let k = qkv.i(1)?.squeeze(0)?;
+        let v = qkv.i(2)?.squeeze(0)?;
 
-        // Apply rotary position embedding
-        let cos = cos.to_dtype(DType::F32)?;
-        let sin = sin.to_dtype(DType::F32)?;
-        q = q.to_dtype(DType::F32)?;
-        k = k.to_dtype(DType::F32)?;
-        v = v.to_dtype(DType::F32)?;
-        (q, k) = apply_rotary_pos_emb_vision(&q, &k, &cos, &sin)?;
+        // Apply rotary position embedding (RoPE needs F32 for numerical stability)
+        // Only convert Q/K for RoPE, keep V in native dtype for SDPA
+        let (q, k) = {
+            let cos_f32 = if cos.dtype() == DType::F32 { cos.clone() } else { cos.to_dtype(DType::F32)? };
+            let sin_f32 = if sin.dtype() == DType::F32 { sin.clone() } else { sin.to_dtype(DType::F32)? };
+            let q_f32 = if q.dtype() == DType::F32 { q.clone() } else { q.to_dtype(DType::F32)? };
+            let k_f32 = if k.dtype() == DType::F32 { k.clone() } else { k.to_dtype(DType::F32)? };
+            let (q_rot, k_rot) = apply_rotary_pos_emb_vision(&q_f32, &k_f32, &cos_f32, &sin_f32)?;
+            // Convert back to input dtype for SDPA (which supports BF16/F16 natively)
+            (q_rot.to_dtype(input_dtype)?, k_rot.to_dtype(input_dtype)?)
+        };
 
         // Process each sequence in the batch
+        // Note: Q, K now in input_dtype after RoPE; V stays in original dtype from QKV projection
         let mut outputs = Vec::new();
         for window in cu_seqlens.windows(2) {
             let start = window[0];
@@ -170,11 +203,13 @@ impl QVisionAttention {
                 continue;
             }
             let len = end - start;
+            // SDPA requires contiguous tensors after transpose
             let q_chunk = q.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
             let k_chunk = k.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
             let v_chunk = v.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
 
-            let mut chunk_out = Sdpa
+            // Run attention (SDPA supports BF16/F16 natively on Metal)
+            let chunk_out = Sdpa
                 .run_attention(
                     &q_chunk.unsqueeze(0)?,
                     &k_chunk.unsqueeze(0)?,
@@ -189,10 +224,9 @@ impl QVisionAttention {
                     },
                 )?
                 .squeeze(0)?
-                .transpose(0, 1)?;
-            chunk_out.device().synchronize()?;
-            chunk_out = chunk_out.reshape((len, self.num_heads * self.head_dim))?;
-            outputs.push(chunk_out.to_dtype(xs.dtype())?);
+                .transpose(0, 1)?
+                .reshape((len, self.num_heads * self.head_dim))?;
+            outputs.push(chunk_out);
         }
         let attn_output = Tensor::cat(&outputs, 0)?;
         self.proj.forward(&attn_output)
@@ -798,20 +832,19 @@ impl QQwen3VLVisionEncoder {
             );
         }
 
-        // Process each temporal slice and accumulate
-        // Reshape to [num_patches, temporal, in_features]
-        let xs = xs.reshape((num_patches, temporal, in_features))?;
+        // OPTIMIZED: Batch matmul instead of temporal loop
+        // Reshape to [num_patches * temporal, in_features] for single matmul
+        let xs_flat = xs.reshape((num_patches * temporal, in_features))?;
 
-        // Apply projection to each temporal slice and sum
-        // Use narrow + squeeze for explicit control (avoids Metal indexing issues with .i())
-        let weight_t = weight_flat.t()?.contiguous()?;
-        let mut out = Tensor::zeros((num_patches, out_channels), DType::F32, xs.device())?;
-        for t in 0..temporal {
-            // Use narrow to select the temporal slice, then squeeze to remove the middle dimension
-            let slice = xs.narrow(1, t, 1)?.squeeze(1)?.contiguous()?; // [num_patches, in_features]
-            let projected = slice.matmul(&weight_t)?; // [num_patches, out_channels]
-            out = (out + projected)?;
-        }
+        // Single matmul: [num_patches * temporal, in_features] @ [in_features, out_channels]
+        let weight_t = weight_flat.t()?;
+        let projected = xs_flat.matmul(&weight_t)?; // [num_patches * temporal, out_channels]
+
+        // Reshape and sum over temporal dimension
+        // [num_patches * temporal, out_channels] -> [num_patches, temporal, out_channels] -> sum -> [num_patches, out_channels]
+        let out = projected
+            .reshape((num_patches, temporal, out_channels))?
+            .sum(1)?; // Sum over temporal dimension
 
         // Apply bias and return
         out.broadcast_add(&bias)?.to_dtype(dtype)
