@@ -647,7 +647,11 @@ impl QQwen3VLVisionEncoder {
         seq.broadcast_matmul(&inv_freq)
     }
 
-    /// Compute 2D rotary position embeddings for vision
+    /// Compute 2D rotary position embeddings for vision (GPU-optimized)
+    ///
+    /// Generates coordinate indices entirely on GPU to avoid CPU-GPU sync bottleneck.
+    /// Pattern: for br in 0..merged_h, for bc in 0..merged_w, for ir in 0..merge_size, for ic in 0..merge_size
+    /// row = br * merge_size + ir, col = bc * merge_size + ic
     fn rot_pos_emb(&self, grid_thw: &Tensor) -> Result<Tensor> {
         let grid = grid_thw.to_vec2::<u32>()?;
         let max_hw = grid
@@ -659,42 +663,102 @@ impl QQwen3VLVisionEncoder {
 
         let freq_table = self.make_rot_pos_emb(max_hw)?;
         let merge_size = self.config.spatial_merge_size;
+        let device = &self.device;
 
-        let mut coords: Vec<(i64, i64)> = Vec::new();
+        let mut all_row_indices: Vec<Tensor> = Vec::new();
+        let mut all_col_indices: Vec<Tensor> = Vec::new();
+
         for g in &grid {
+            let t = g[0] as usize;
             let h = g[1] as usize;
             let w = g[2] as usize;
             let merged_h = h / merge_size;
             let merged_w = w / merge_size;
 
-            let mut base_coords: Vec<(i64, i64)> = Vec::with_capacity(h * w);
-            for br in 0..merged_h {
-                for bc in 0..merged_w {
-                    for ir in 0..merge_size {
-                        for ic in 0..merge_size {
-                            base_coords.push((
-                                (br * merge_size + ir) as i64,
-                                (bc * merge_size + ic) as i64,
-                            ));
-                        }
-                    }
-                }
-            }
+            // GPU-side coordinate generation
+            // Loop order: br (outer) -> bc -> ir -> ic (inner)
+            let repeat_per_br = merged_w * merge_size * merge_size;
+            let repeat_per_bc = merge_size * merge_size;
+
+            // br: each value [0..merged_h) repeated repeat_per_br times
+            // [0,0,0,0,..., 1,1,1,1,..., ..., merged_h-1,...]
+            let br = Tensor::arange(0i64, merged_h as i64, device)?
+                .unsqueeze(1)? // [merged_h, 1]
+                .repeat((1, repeat_per_br))? // [merged_h, repeat_per_br]
+                .flatten_all()?; // [merged_h * repeat_per_br]
+
+            // bc: each value [0..merged_w) repeated repeat_per_bc times, tiled merged_h times
+            // [0,0,0,0, 1,1,1,1, ..., merged_w-1,...] repeated merged_h times
+            let bc_row = Tensor::arange(0i64, merged_w as i64, device)?
+                .unsqueeze(1)? // [merged_w, 1]
+                .repeat((1, repeat_per_bc))? // [merged_w, repeat_per_bc]
+                .flatten_all()?; // [merged_w * repeat_per_bc]
+            let bc = bc_row
+                .unsqueeze(0)? // [1, merged_w * repeat_per_bc]
+                .repeat((merged_h, 1))? // [merged_h, merged_w * repeat_per_bc]
+                .flatten_all()?; // [total_spatial]
+
+            // ir: each value [0..merge_size) repeated merge_size times (for ic), tiled for all blocks
+            // [0,0,1,1, 0,0,1,1, ...] for merge_size=2
+            let ir_block = Tensor::arange(0i64, merge_size as i64, device)?
+                .unsqueeze(1)? // [merge_size, 1]
+                .repeat((1, merge_size))? // [merge_size, merge_size]
+                .flatten_all()?; // [merge_size^2]
+            let ir = ir_block
+                .unsqueeze(0)? // [1, merge_size^2]
+                .repeat((merged_h * merged_w, 1))? // [merged_h * merged_w, merge_size^2]
+                .flatten_all()?; // [total_spatial]
+
+            // ic: [0..merge_size) tiled for everything
+            // [0,1, 0,1, 0,1, ...] for merge_size=2
+            let ic_single = Tensor::arange(0i64, merge_size as i64, device)?; // [merge_size]
+            let ic = ic_single
+                .unsqueeze(0)? // [1, merge_size]
+                .repeat((merged_h * merged_w * merge_size, 1))? // [n, merge_size]
+                .flatten_all()?; // [total_spatial]
+
+            // Compute coordinates: row = br * merge_size + ir, col = bc * merge_size + ic
+            // Use affine(scale, bias) for scalar multiplication: tensor * scale + bias
+            let row_coords = br
+                .to_dtype(DType::F32)?
+                .affine(merge_size as f64, 0.)?
+                .broadcast_add(&ir.to_dtype(DType::F32)?)?
+                .to_dtype(DType::I64)?;
+            let col_coords = bc
+                .to_dtype(DType::F32)?
+                .affine(merge_size as f64, 0.)?
+                .broadcast_add(&ic.to_dtype(DType::F32)?)?
+                .to_dtype(DType::I64)?;
 
             // Repeat for temporal dimension
-            for _ in 0..(g[0] as usize) {
-                coords.extend(base_coords.iter().cloned());
-            }
+            let row_coords = if t > 1 {
+                row_coords
+                    .unsqueeze(0)? // [1, spatial]
+                    .repeat((t, 1))? // [t, spatial]
+                    .flatten_all()? // [t * spatial]
+            } else {
+                row_coords
+            };
+            let col_coords = if t > 1 {
+                col_coords
+                    .unsqueeze(0)?
+                    .repeat((t, 1))?
+                    .flatten_all()?
+            } else {
+                col_coords
+            };
+
+            all_row_indices.push(row_coords);
+            all_col_indices.push(col_coords);
         }
 
-        let total_tokens = coords.len();
-        let (rows, cols): (Vec<i64>, Vec<i64>) = coords.into_iter().unzip();
-
-        let rows = Tensor::from_vec(rows, (total_tokens,), &self.device)?;
-        let cols = Tensor::from_vec(cols, (total_tokens,), &self.device)?;
+        // Concatenate all grids
+        let rows = Tensor::cat(&all_row_indices, 0)?;
+        let cols = Tensor::cat(&all_col_indices, 0)?;
         let row_embeds = freq_table.index_select(&rows, 0)?;
         let col_embeds = freq_table.index_select(&cols, 0)?;
 
+        let total_tokens = rows.dim(0)?;
         Tensor::stack(&[row_embeds, col_embeds], D::Minus2)?
             .reshape((total_tokens, freq_table.dim(D::Minus1)? * 2))
     }
