@@ -5869,7 +5869,10 @@ impl IsqModelLoader for Qwen3VLMoELoader {
             Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.down_proj\.(weight|bias)$")?,
             // MoE router
             Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.gate\.(weight|bias)$")?,
-            // MoE experts - now unpacked into individual experts
+            // MoE experts - stacked format (Qwen3 VL MoE uses this)
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.down_proj$")?,
+            // MoE experts - per-expert format (fallback for other models)
             Regex::new(
                 r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\.(weight|bias)$",
             )?,

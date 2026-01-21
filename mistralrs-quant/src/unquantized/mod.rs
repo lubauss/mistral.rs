@@ -150,58 +150,81 @@ impl QuantMethod for UnquantLinear {
         let w = &self.w;
         let (_num_experts, out_features, _in_features) = w.dims3()?;
 
+        // Check if we can use the fused gather_mm kernel (Metal only for now)
+        let use_fused_kernel = matches!(a.device().location(), DeviceLocation::Metal { .. });
+
         match a.dims() {
             // Metal path: 5D input (b_size, seq_len, 1, 1, hidden_dim)
             &[b_size, seq_len, 1, 1, hidden_dim] => {
                 let (_b, _s, num_experts_per_tok) = indices.dims3()?;
-                // Flatten indices to select experts
-                let flat_indices = indices.reshape((b_size * seq_len * num_experts_per_tok,))?;
+                let m = b_size * seq_len * num_experts_per_tok;
 
-                // Select expert weights: [b*s*k, out_features, in_features]
-                let selected_w = w.index_select(&flat_indices, 0)?;
+                // Flatten indices: [b*s*k]
+                let flat_indices = indices.reshape((m,))?.to_dtype(DType::U32)?;
 
-                // Reshape input: [b*s, hidden_dim]
-                let a_flat = a.reshape((b_size * seq_len, hidden_dim))?;
+                if use_fused_kernel {
+                    // Use fused gather_mm kernel
+                    // Broadcast a to [b*s, k, hidden] then flatten to [m, hidden]
+                    let a_flat = a.reshape((b_size * seq_len, hidden_dim))?;
+                    let a_expanded = a_flat
+                        .unsqueeze(1)?
+                        .broadcast_as((b_size * seq_len, num_experts_per_tok, hidden_dim))?
+                        .reshape((m, hidden_dim))?
+                        .contiguous()?;
 
-                // For each token, we need to compute with each selected expert
-                // Broadcast a to match: [b*s, 1, hidden_dim] -> [b*s, k, hidden_dim]
-                let a_expanded = a_flat
-                    .unsqueeze(1)?
-                    .broadcast_as((b_size * seq_len, num_experts_per_tok, hidden_dim))?
-                    .reshape((b_size * seq_len * num_experts_per_tok, hidden_dim))?;
+                    // gather_mm: [m, k] @ [experts, n, k][indices] -> [m, n]
+                    let result = a_expanded.gather_mm(w, &flat_indices)?;
 
-                // Matmul: [b*s*k, hidden_dim] @ [b*s*k, hidden_dim, out_features] -> [b*s*k, out_features]
-                let result = a_expanded
-                    .unsqueeze(1)?
-                    .matmul(&selected_w.transpose(1, 2)?)?
-                    .squeeze(1)?;
+                    // Reshape back to [b, s, k, out_features]
+                    result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                } else {
+                    // Fallback: index_select + matmul
+                    let selected_w = w.index_select(&flat_indices, 0)?;
+                    let a_flat = a.reshape((b_size * seq_len, hidden_dim))?;
+                    let a_expanded = a_flat
+                        .unsqueeze(1)?
+                        .broadcast_as((b_size * seq_len, num_experts_per_tok, hidden_dim))?
+                        .reshape((m, hidden_dim))?;
 
-                // Reshape back to [b, s, k, out_features]
-                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                    let result = a_expanded
+                        .unsqueeze(1)?
+                        .matmul(&selected_w.transpose(1, 2)?)?
+                        .squeeze(1)?;
+
+                    result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                }
             }
             // CUDA path: 3D input (num_tokens, 1, hidden_dim)
             &[num_tokens, 1, hidden_dim] => {
                 let (_, num_experts_per_tok) = indices.dims2()?;
+                let m = num_tokens * num_experts_per_tok;
 
                 // Flatten indices
-                let flat_indices = indices.reshape((num_tokens * num_experts_per_tok,))?;
+                let flat_indices = indices.reshape((m,))?.to_dtype(DType::U32)?;
 
-                // Select expert weights: [n*k, out_features, in_features]
-                let selected_w = w.index_select(&flat_indices, 0)?;
+                if use_fused_kernel {
+                    // Use fused gather_mm kernel
+                    let a_expanded = a
+                        .broadcast_as((num_tokens, num_experts_per_tok, hidden_dim))?
+                        .reshape((m, hidden_dim))?
+                        .contiguous()?;
 
-                // Broadcast input: [n, 1, hidden] -> [n, k, hidden] -> [n*k, hidden]
-                let a_expanded = a
-                    .broadcast_as((num_tokens, num_experts_per_tok, hidden_dim))?
-                    .reshape((num_tokens * num_experts_per_tok, hidden_dim))?;
+                    let result = a_expanded.gather_mm(w, &flat_indices)?;
+                    result.reshape((num_tokens, num_experts_per_tok, out_features))
+                } else {
+                    // Fallback: index_select + matmul
+                    let selected_w = w.index_select(&flat_indices, 0)?;
+                    let a_expanded = a
+                        .broadcast_as((num_tokens, num_experts_per_tok, hidden_dim))?
+                        .reshape((m, hidden_dim))?;
 
-                // Matmul: [n*k, hidden] @ [n*k, hidden, out] -> [n*k, out]
-                let result = a_expanded
-                    .unsqueeze(1)?
-                    .matmul(&selected_w.transpose(1, 2)?)?
-                    .squeeze(1)?;
+                    let result = a_expanded
+                        .unsqueeze(1)?
+                        .matmul(&selected_w.transpose(1, 2)?)?
+                        .squeeze(1)?;
 
-                // Reshape to [n, k, out]
-                result.reshape((num_tokens, num_experts_per_tok, out_features))
+                    result.reshape((num_tokens, num_experts_per_tok, out_features))
+                }
             }
             // Metal path: 4D intermediate input (b_size, seq_len, num_experts_per_tok, intermediate_dim)
             // Used for down projection in MoE where input is from gate/up projections
@@ -213,23 +236,26 @@ impl QuantMethod for UnquantLinear {
                     num_experts_per_tok, indices_k
                 );
 
-                // Flatten indices to select experts
-                let flat_indices = indices.reshape((b_size * seq_len * num_experts_per_tok,))?;
+                let m = b_size * seq_len * num_experts_per_tok;
+                let flat_indices = indices.reshape((m,))?.to_dtype(DType::U32)?;
 
-                // Select expert weights: [b*s*k, out_features, in_features]
-                let selected_w = w.index_select(&flat_indices, 0)?;
+                if use_fused_kernel {
+                    // Use fused gather_mm kernel
+                    let a_flat = a.reshape((m, intermediate_dim))?.contiguous()?;
+                    let result = a_flat.gather_mm(w, &flat_indices)?;
+                    result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                } else {
+                    // Fallback: index_select + matmul
+                    let selected_w = w.index_select(&flat_indices, 0)?;
+                    let a_flat = a.reshape((m, intermediate_dim))?;
 
-                // Reshape input: [b*s*k, intermediate_dim]
-                let a_flat = a.reshape((b_size * seq_len * num_experts_per_tok, intermediate_dim))?;
+                    let result = a_flat
+                        .unsqueeze(1)?
+                        .matmul(&selected_w.transpose(1, 2)?)?
+                        .squeeze(1)?;
 
-                // Matmul: [b*s*k, intermediate_dim] @ [b*s*k, intermediate_dim, out_features] -> [b*s*k, out_features]
-                let result = a_flat
-                    .unsqueeze(1)?
-                    .matmul(&selected_w.transpose(1, 2)?)?
-                    .squeeze(1)?;
-
-                // Reshape back to [b, s, k, out_features]
-                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                    result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                }
             }
             dims => {
                 candle_core::bail!(
