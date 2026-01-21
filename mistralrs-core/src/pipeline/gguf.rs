@@ -1,13 +1,16 @@
 use super::llg::build_llg_factory;
 use super::{
     get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
-    CacheManager, GeneralMetadata, Loader, ModelKind, ModelPaths, PrettyName, QuantizationKind,
-    TokenSource,
+    CacheManager, GeneralMetadata, Loader, ModelKind, ModelPaths, PrettyName, Processor,
+    QuantizationKind, TokenSource,
 };
 use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
-    MetadataMixin, ModelCategory, PreProcessingMixin,
+    MetadataMixin, ModelCategory, MultimodalPromptPrefixer, PreProcessingMixin,
 };
+use crate::vision_models::preprocessor_config::PreProcessorConfig;
+use crate::vision_models::qwen3_vl::{inputs_processor::Qwen3VLProcessor, Qwen3VLVisionSpecificArgs};
+use crate::vision_models::ModelInputs as VisionModelInputs;
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
 use crate::gguf::{
@@ -42,6 +45,8 @@ use crate::{
     models::quantized_qwen::ModelWeights as QQwen,
     models::quantized_qwen3::ModelWeights as QQwen3,
     models::quantized_qwen3_moe::ModelWeights as QQwen3MoE,
+    models::quantized_qwen3_vl::ModelWeights as QQwen3Vl,
+    models::quantized_qwen3_vl_vision::QQwen3VLVisionEncoder,
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
     utils::tokens::get_token,
     xlora_models::{XLoraQLlama, XLoraQPhi3},
@@ -71,7 +76,20 @@ enum Model {
     Qwen(QQwen),
     Qwen3(QQwen3),
     Qwen3MoE(QQwen3MoE),
+    Qwen3Vl(QQwen3Vl),
 }
+
+impl Model {
+    fn is_vision(&self) -> bool {
+        matches!(self, Model::Qwen3Vl(_))
+    }
+}
+
+/// No-op prefixer for GGUF vision models.
+/// The chat template handles image tokens via MessagesAction::Keep.
+struct GGUFVisionPrefixer;
+
+impl MultimodalPromptPrefixer for GGUFVisionPrefixer {}
 
 pub struct GGUFPipeline {
     model: Model,
@@ -82,6 +100,10 @@ pub struct GGUFPipeline {
     non_granular_state: Option<NonGranularState>,
     metadata: Arc<GeneralMetadata>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
+    /// Vision-specific: processor for image preprocessing
+    processor: Option<Arc<dyn Processor + Send + Sync>>,
+    /// Vision-specific: preprocessor config for image parameters
+    preprocessor_config: Option<Arc<PreProcessorConfig>>,
 }
 
 /// Loader for a GGUF model.
@@ -104,6 +126,9 @@ pub struct GGUFLoader {
 /// Config for a GGUF loader.
 pub struct GGUFSpecificConfig {
     pub topology: Option<Topology>,
+    /// Path to multimodal projector GGUF file for vision models.
+    /// This is required for GGUF vision models like Qwen3-VL.
+    pub mmproj_path: Option<String>,
 }
 
 #[derive(Default)]
@@ -325,6 +350,18 @@ impl Loader for GGUFLoader {
         }
         let arch = model.arch();
 
+        // Validate mmproj configuration
+        if arch.supports_vision() && self.config.mmproj_path.is_none() {
+            anyhow::bail!(
+                "Vision architecture `{arch:?}` requires --mmproj flag to specify the multimodal projector GGUF file"
+            );
+        }
+        if !arch.supports_vision() && self.config.mmproj_path.is_some() {
+            tracing::warn!(
+                "--mmproj flag will be ignored for non-vision architecture `{arch:?}`"
+            );
+        }
+
         // If auto, convert to Map
         let num_layers = model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
         if let DeviceMapSetting::Auto(params) = mapper.clone() {
@@ -453,6 +490,55 @@ impl Loader for GGUFLoader {
                 GGUFArchitecture::Qwen2 => Model::Qwen(QQwen::try_from(model_config)?),
                 GGUFArchitecture::Qwen3 => Model::Qwen3(QQwen3::try_from(model_config)?),
                 GGUFArchitecture::Qwen3MoE => Model::Qwen3MoE(QQwen3MoE::try_from(model_config)?),
+                GGUFArchitecture::Qwen3Vl | GGUFArchitecture::Qwen3VlMoE => {
+                    // Vision architecture requires loading mmproj file separately
+                    let mmproj_path = self.config.mmproj_path.as_ref()
+                        .expect("mmproj_path should be validated earlier");
+
+                    info!("Loading multimodal projector from: {mmproj_path}");
+
+                    // Load mmproj GGUF content (separate from LLM content)
+                    let mut mmproj_file = std::fs::File::open(mmproj_path)
+                        .map_err(|e| anyhow::anyhow!(
+                            "Failed to open mmproj file '{}': {e}",
+                            mmproj_path
+                        ))?;
+                    let mut mmproj_readers: Vec<&mut std::fs::File> = vec![&mut mmproj_file];
+                    let mut mmproj_content = Content::from_readers(&mut mmproj_readers)?;
+
+                    // Validate mmproj architecture
+                    let mmproj_arch = mmproj_content.arch();
+                    info!("mmproj architecture: {mmproj_arch:?}");
+                    if !mmproj_arch.is_vision_encoder() {
+                        bail!(
+                            "mmproj file has unexpected architecture `{mmproj_arch:?}`, expected CLIP. \
+                            Ensure you're providing a vision encoder mmproj file, not an LLM GGUF."
+                        );
+                    }
+
+                    // Load vision encoder from mmproj content
+                    let vision_encoder = QQwen3VLVisionEncoder::load(&mut mmproj_content, device)?;
+                    let vision_config = vision_encoder.config();
+                    info!(
+                        "Loaded vision encoder: {} blocks, {} embed dim, {} spatial merge",
+                        vision_config.block_count,
+                        vision_config.embedding_length,
+                        vision_config.spatial_merge_size
+                    );
+
+                    // Load LLM text model using standard TryFrom pattern
+                    let mut llm_model = QQwen3Vl::try_from(model_config)?;
+
+                    // Attach vision encoder to LLM
+                    llm_model.set_vision_encoder(vision_encoder);
+                    info!("Vision encoder attached to LLM model");
+
+                    Model::Qwen3Vl(llm_model)
+                }
+                GGUFArchitecture::Clip => {
+                    bail!("CLIP architecture is for mmproj files only, not standalone models. \
+                          Use --mmproj flag with a vision-capable LLM architecture like qwen3vl.");
+                }
                 a => bail!("Unsupported architecture `{a:?}` for GGUF"),
             },
             ModelKind::GgufAdapter { adapter, .. } => match arch {
@@ -515,6 +601,7 @@ impl Loader for GGUFLoader {
             Model::Qwen(ref p) => p.max_seq_len,
             Model::Qwen3(ref p) => p.max_seq_len,
             Model::Qwen3MoE(ref p) => p.max_seq_len,
+            Model::Qwen3Vl(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
@@ -527,6 +614,7 @@ impl Loader for GGUFLoader {
             Model::Qwen(ref model) => model.cache.normal().0.len(),
             Model::Qwen3(ref model) => model.cache.normal().0.len(),
             Model::Qwen3MoE(ref model) => model.cache.normal().0.len(),
+            Model::Qwen3Vl(ref model) => model.cache.normal().0.len(),
         };
 
         if chat_template.bos_token.is_none() {
@@ -546,6 +634,26 @@ impl Loader for GGUFLoader {
         }
 
         let eos = calculate_eos_tokens(&chat_template, gen_conf, &tokenizer);
+        let is_vision_model = model.is_vision();
+        // Set up vision processor and config for vision models
+        let (processor, preprocessor_config): (
+            Option<Arc<dyn Processor + Send + Sync>>,
+            Option<Arc<PreProcessorConfig>>,
+        ) = if is_vision_model {
+            // Create preprocessor config matching GGUF mmproj parameters
+            // GGUF Qwen3-VL uses patch_size=16, temporal_patch_size=2, merge_size=2
+            let mut config = PreProcessorConfig::default();
+            config.patch_size = Some(16);  // GGUF mmproj uses 16, not 14
+            config.temporal_patch_size = Some(2);
+            config.merge_size = Some(2);
+            (
+                Some(Arc::new(Qwen3VLProcessor::new(None))),
+                Some(Arc::new(config)),
+            )
+        } else {
+            (None, None)
+        };
+
         Ok(Arc::new(Mutex::new(GGUFPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -576,11 +684,17 @@ impl Loader for GGUFLoader {
                 cache_engine,
                 model_metadata: Some(Arc::new(model_config_metadata)),
                 modalities: Modalities {
-                    input: vec![SupportedModality::Text],
+                    input: if is_vision_model {
+                        vec![SupportedModality::Text, SupportedModality::Vision]
+                    } else {
+                        vec![SupportedModality::Text]
+                    },
                     output: vec![SupportedModality::Text],
                 },
             }),
             mapper: pipeline_mapper,
+            processor,
+            preprocessor_config,
         })))
     }
 
@@ -601,7 +715,14 @@ impl PreProcessingMixin for GGUFPipeline {
         Some(self.chat_template.clone())
     }
     fn get_input_processor_config(&self) -> Option<Arc<dyn Any>> {
-        None
+        self.preprocessor_config
+            .as_ref()
+            .map(|c| c.clone() as Arc<dyn Any>)
+    }
+    fn get_processor(&self) -> Arc<dyn Processor> {
+        self.processor
+            .clone()
+            .unwrap_or_else(|| Arc::new(super::processing::BasicProcessor))
     }
 }
 
@@ -660,6 +781,7 @@ impl CacheManagerMixin for GGUFPipeline {
             Model::Qwen(ref model) => &model.cache,
             Model::Qwen3(ref model) => &model.cache,
             Model::Qwen3MoE(ref model) => &model.cache,
+            Model::Qwen3Vl(ref model) => &model.cache,
         }
     }
 }
@@ -676,6 +798,7 @@ impl MetadataMixin for GGUFPipeline {
             Model::Qwen(ref model) => model.device.clone(),
             Model::Qwen3(ref model) => model.device.clone(),
             Model::Qwen3MoE(ref model) => model.device.clone(),
+            Model::Qwen3Vl(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -705,75 +828,151 @@ impl Pipeline for GGUFPipeline {
         inputs: Box<dyn Any>,
         return_raw_logits: bool,
     ) -> Result<ForwardInputsResult, candle_core::Error> {
-        let ModelInputs {
-            input_ids,
-            input_ids_full,
-            seqlen_offsets,
-            seqlen_offsets_full,
-            context_lens,
-            position_ids: _, // NOTE(EricLBuehler): ignore, it is for phi3
-            paged_attn_meta,
-            flash_meta,
-            flash_meta_full,
-        } = *inputs.downcast().expect("Downcast failed.");
         let metadata = self.get_metadata();
-        let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
-            (Some(engine), Some(meta)) => Some((engine.get_kv_cache().clone(), meta)),
-            (Some(_), None) => {
-                // This can happen if Rust-side user code is wrong
-                candle_core::bail!("Forward step expected a PagedAttention input metadata. This was not provided, please ensure that the scheduler config is correctly configured for PagedAttention.")
+
+        // Try to downcast to vision inputs first for vision models
+        let logits = if self.model.is_vision() {
+            // Try vision model inputs first (has pixel_values and model_specific_args)
+            if let Ok(vision_inputs) = inputs.downcast::<VisionModelInputs>() {
+                let VisionModelInputs {
+                    input_ids,
+                    seqlen_offsets,
+                    context_lens,
+                    position_ids: _,
+                    pixel_values,
+                    model_specific_args,
+                    paged_attn_meta,
+                    flash_meta: _,
+                } = *vision_inputs;
+
+                let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
+                    (Some(engine), Some(meta)) => Some((engine.get_kv_cache().clone(), meta)),
+                    (Some(_), None) => {
+                        candle_core::bail!("Forward step expected a PagedAttention input metadata.")
+                    }
+                    (None, Some(_)) => {
+                        candle_core::bail!("Forward step got PagedAttention metadata but no cache engine.")
+                    }
+                    (None, None) => None,
+                };
+
+                match &self.model {
+                    Model::Qwen3Vl(model) => {
+                        // Extract vision-specific args
+                        let Qwen3VLVisionSpecificArgs {
+                            input_ids_full: _,
+                            image_grid_thw,
+                            video_grid_thw: _,
+                            seqlens: _,
+                            continuous_img_pad,
+                            continuous_vid_pad: _,
+                        } = *model_specific_args
+                            .downcast()
+                            .expect("Cannot downcast into Qwen3VLVisionSpecificArgs");
+
+                        // Build image_positions from continuous_img_pad
+                        // Format: (batch_idx, start_pos, end_pos)
+                        let mut image_positions = Vec::new();
+                        for (batch_idx, pads) in continuous_img_pad.iter().enumerate() {
+                            for (start, end) in pads {
+                                image_positions.push((batch_idx, *start, *end));
+                            }
+                        }
+
+                        model.forward_with_vision(
+                            &input_ids,
+                            pixel_values.as_ref(),
+                            image_grid_thw.as_ref(),
+                            &image_positions,
+                            &seqlen_offsets,
+                            context_lens,
+                            paged_attn_meta,
+                        )?
+                    }
+                    _ => {
+                        candle_core::bail!("Vision inputs received for non-vision model")
+                    }
+                }
+            } else {
+                // Fallback: no vision inputs, this shouldn't happen for vision models with images
+                candle_core::bail!("Vision model expected VisionModelInputs but got text inputs")
             }
-            (None, Some(_)) => {
-                // This should never happen but we handle it anyway
-                candle_core::bail!("Forward step got a PagedAttention input metadata but there is no cache engine. Please raise an issue.")
-            }
-            (None, None) => None,
-        };
-        let logits = match self.model {
-            Model::Llama(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
-            }
-            Model::Phi2(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
-            }
-            Model::XLoraLlama(ref model) => model.forward(
-                &input_ids,
-                input_ids_full.as_ref().unwrap_or(&input_ids),
-                &seqlen_offsets,
-                seqlen_offsets_full.as_ref().unwrap_or(&seqlen_offsets),
-                self.no_kv_cache,
-                &self.non_granular_state,
+        } else {
+            // Text models: use standard ModelInputs
+            let ModelInputs {
+                input_ids,
+                input_ids_full,
+                seqlen_offsets,
+                seqlen_offsets_full,
                 context_lens,
-                &flash_meta,
-                flash_meta_full.as_ref().unwrap_or(&flash_meta),
-            )?,
-            Model::Phi3(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
-            }
-            Model::XLoraPhi3(ref model) => model.forward(
-                &input_ids,
-                input_ids_full.as_ref().unwrap_or(&input_ids),
-                &seqlen_offsets,
-                seqlen_offsets_full.as_ref().unwrap_or(&seqlen_offsets),
-                self.no_kv_cache,
-                &self.non_granular_state,
-                context_lens,
-                &flash_meta,
-                flash_meta_full.as_ref().unwrap_or(&flash_meta),
-            )?,
-            Model::Starcoder2(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
-            }
-            Model::Qwen(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
-            }
-            Model::Qwen3(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
-            }
-            Model::Qwen3MoE(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                position_ids: _,
+                paged_attn_meta,
+                flash_meta,
+                flash_meta_full,
+            } = *inputs.downcast().expect("Downcast failed.");
+
+            let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
+                (Some(engine), Some(meta)) => Some((engine.get_kv_cache().clone(), meta)),
+                (Some(_), None) => {
+                    candle_core::bail!("Forward step expected a PagedAttention input metadata. This was not provided, please ensure that the scheduler config is correctly configured for PagedAttention.")
+                }
+                (None, Some(_)) => {
+                    candle_core::bail!("Forward step got a PagedAttention input metadata but there is no cache engine. Please raise an issue.")
+                }
+                (None, None) => None,
+            };
+
+            match self.model {
+                Model::Llama(ref model) => {
+                    model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                }
+                Model::Phi2(ref model) => {
+                    model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                }
+                Model::XLoraLlama(ref model) => model.forward(
+                    &input_ids,
+                    input_ids_full.as_ref().unwrap_or(&input_ids),
+                    &seqlen_offsets,
+                    seqlen_offsets_full.as_ref().unwrap_or(&seqlen_offsets),
+                    self.no_kv_cache,
+                    &self.non_granular_state,
+                    context_lens,
+                    &flash_meta,
+                    flash_meta_full.as_ref().unwrap_or(&flash_meta),
+                )?,
+                Model::Phi3(ref model) => {
+                    model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
+                }
+                Model::XLoraPhi3(ref model) => model.forward(
+                    &input_ids,
+                    input_ids_full.as_ref().unwrap_or(&input_ids),
+                    &seqlen_offsets,
+                    seqlen_offsets_full.as_ref().unwrap_or(&seqlen_offsets),
+                    self.no_kv_cache,
+                    &self.non_granular_state,
+                    context_lens,
+                    &flash_meta,
+                    flash_meta_full.as_ref().unwrap_or(&flash_meta),
+                )?,
+                Model::Starcoder2(ref model) => {
+                    model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
+                }
+                Model::Qwen(ref model) => {
+                    model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                }
+                Model::Qwen3(ref model) => {
+                    model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                }
+                Model::Qwen3MoE(ref model) => {
+                    model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                }
+                Model::Qwen3Vl(ref model) => {
+                    // Text-only forward (no images in this request)
+                    model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                }
             }
         };
+
         if return_raw_logits {
             Ok(ForwardInputsResult::RawLogits { logits })
         } else {
@@ -791,7 +990,13 @@ impl Pipeline for GGUFPipeline {
         sample_and_add_toks(self, seqs, logits, prefix_cacher, disable_eos_stop, rng).await
     }
     fn category(&self) -> ModelCategory {
-        ModelCategory::Text
+        if self.model.is_vision() {
+            ModelCategory::Vision {
+                prefixer: Arc::new(GGUFVisionPrefixer),
+            }
+        } else {
+            ModelCategory::Text
+        }
     }
 }
 

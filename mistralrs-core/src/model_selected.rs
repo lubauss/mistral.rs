@@ -347,6 +347,11 @@ pub enum ModelSelected {
         /// Maximum prompt batch size to expect for this model. This affects automatic device mapping but is not a hard limit.
         #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
         max_batch_size: usize,
+
+        /// Path to multimodal projector GGUF file for vision models (e.g., mmproj-Qwen3VL-F16.gguf).
+        /// Required for GGUF vision models like Qwen3-VL.
+        #[arg(long)]
+        mmproj: Option<String>,
     },
 
     /// Select a GGUF model with X-LoRA.

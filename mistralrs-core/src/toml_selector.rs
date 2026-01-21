@@ -768,6 +768,7 @@ fn loader_from_selected(
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                mmproj_path: None, // TOML GGUF doesn't support vision yet
             },
             args.no_kv_cache,
             args.jinja_explicit,
@@ -794,6 +795,7 @@ fn loader_from_selected(
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                mmproj_path: None, // XLoraGGUF doesn't support vision yet
             },
             args.no_kv_cache,
             args.jinja_explicit,
@@ -826,6 +828,7 @@ fn loader_from_selected(
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                mmproj_path: None, // LoraGGUF doesn't support vision yet
             },
             args.no_kv_cache,
             args.jinja_explicit,

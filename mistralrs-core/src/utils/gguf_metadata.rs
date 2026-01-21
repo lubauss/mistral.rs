@@ -314,7 +314,11 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 token_embd + output_norm + output
             }
-            GGUFArchitecture::Qwen2 | GGUFArchitecture::Qwen3 | GGUFArchitecture::Qwen3MoE => {
+            GGUFArchitecture::Qwen2
+            | GGUFArchitecture::Qwen3
+            | GGUFArchitecture::Qwen3MoE
+            | GGUFArchitecture::Qwen3Vl
+            | GGUFArchitecture::Qwen3VlMoE => {
                 let token_embd = tensor_info_size_in_bytes!(
                     self.model.tensor_info("token_embd.weight")?,
                     DType::F32
@@ -479,7 +483,11 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
 
                 attn_norm + ffn_norm + attn_qkv + attn_output + ffn_up + ffn_down
             }
-            GGUFArchitecture::Qwen2 | GGUFArchitecture::Qwen3 | GGUFArchitecture::Qwen3MoE => {
+            GGUFArchitecture::Qwen2
+            | GGUFArchitecture::Qwen3
+            | GGUFArchitecture::Qwen3MoE
+            | GGUFArchitecture::Qwen3Vl
+            | GGUFArchitecture::Qwen3VlMoE => {
                 let attn_norm = tensor_info_size_in_bytes!(
                     self.model.tensor_info("blk.0.attn_norm.weight")?,
                     DType::F32
@@ -513,7 +521,12 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     .model
                     .tensor_info("blk.0.attn_output.weight")?);
 
-                let ffn_gate = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                let is_moe = matches!(
+                    self.arch,
+                    GGUFArchitecture::Qwen3MoE | GGUFArchitecture::Qwen3VlMoE
+                );
+
+                let ffn_gate = if is_moe {
                     tensor_info_size_in_bytes!(self
                         .model
                         .tensor_info("blk.0.ffn_gate_exps.weight")?)
@@ -521,7 +534,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_gate.weight")?)
                 };
 
-                let ffn_up = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                let ffn_up = if is_moe {
                     tensor_info_size_in_bytes!(self
                         .model
                         .tensor_info("blk.0.ffn_up_exps.weight")?)
@@ -529,7 +542,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_up.weight")?)
                 };
 
-                let ffn_down = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                let ffn_down = if is_moe {
                     tensor_info_size_in_bytes!(self
                         .model
                         .tensor_info("blk.0.ffn_down_exps.weight")?)
