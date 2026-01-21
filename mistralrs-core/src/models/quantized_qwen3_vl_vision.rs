@@ -865,19 +865,23 @@ impl QQwen3VLVisionEncoder {
     }
 
     /// Apply 2D patch embedding (convolution)
+    /// OPTIMIZED: Uses native dtype (BF16/F16) - Metal GEMM kernels support these dtypes
     fn patch_embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
         // xs shape: [num_patches, patch_pixels] where patch_pixels = channels * temporal * H * W
         // weight shape: [out_channels, in_channels, patch_h, patch_w] (4D conv kernel)
         // GGUF mmproj uses 2D conv, so temporal is folded into batch dimension
+
+        // Use input dtype throughout - Metal supports BF16/F16 GEMM
         let dtype = xs.dtype();
-        let xs = xs.to_dtype(DType::F32)?;
-        let weight = self.patch_embed_weight.to_dtype(DType::F32)?;
-        let bias = self.patch_embed_bias.to_dtype(DType::F32)?;
 
         // Flatten conv weight from [out_channels, in_channels, H, W] to [out_channels, in_channels*H*W]
-        let weight_shape = weight.dims();
+        let weight_shape = self.patch_embed_weight.dims();
         let out_channels = weight_shape[0];
         let in_features: usize = weight_shape[1..].iter().product();
+
+        // Convert weight and bias to match input dtype (avoids F32 round-trip)
+        let weight = self.patch_embed_weight.to_dtype(dtype)?;
+        let bias = self.patch_embed_bias.to_dtype(dtype)?;
         let weight_flat = weight.reshape((out_channels, in_features))?;
 
         // Input has shape [num_patches, in_features * temporal] where temporal features are interleaved
@@ -900,7 +904,7 @@ impl QQwen3VLVisionEncoder {
         // Reshape to [num_patches * temporal, in_features] for single matmul
         let xs_flat = xs.reshape((num_patches * temporal, in_features))?;
 
-        // Single matmul: [num_patches * temporal, in_features] @ [in_features, out_channels]
+        // Single matmul in native dtype (F16/BF16) - no F32 conversion needed on Metal
         let weight_t = weight_flat.t()?;
         let projected = xs_flat.matmul(&weight_t)?; // [num_patches * temporal, out_channels]
 
@@ -910,8 +914,8 @@ impl QQwen3VLVisionEncoder {
             .reshape((num_patches, temporal, out_channels))?
             .sum(1)?; // Sum over temporal dimension
 
-        // Apply bias and return
-        out.broadcast_add(&bias)?.to_dtype(dtype)
+        // Apply bias and return (already in native dtype)
+        out.broadcast_add(&bias)
     }
 
     /// Forward pass through the vision encoder.
