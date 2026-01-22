@@ -60,7 +60,7 @@ impl Qwen2VLModel {
         )?;
         let text = Qwen2VLTextModel::new(
             cfg,
-            vb.clone(),
+            vb, // No clone needed - vb not used after this
             is_gptx,
             normal_loading_metadata,
             attention_mechanism,
