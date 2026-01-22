@@ -544,6 +544,13 @@ impl Qwen3VLImageProcessor {
             };
             let image = <Tensor as ApplyTensorTransforms>::apply(&image, transforms, device)?;
 
+            // Swap G and B channels (indices 1 and 2) to fix channel order mismatch
+            // This is needed because the vision encoder expects BGR order from the GGUF weights
+            let r = image.i(0)?;
+            let g = image.i(1)?;
+            let b = image.i(2)?;
+            let image = Tensor::stack(&[r, b, g], 0)?;
+
             processed_images.push(image);
         }
 
@@ -582,7 +589,10 @@ impl Qwen3VLImageProcessor {
             merge_size,
             patch_size,
         ])?;
-        patches = patches.permute([0, 3, 6, 4, 7, 2, 1, 5, 8])?;
+        // Permute to [grid_t, gh/ms, gw/ms, ms_h, ms_w, temporal, channel, ph, pw]
+        // This produces [T, C, H*W] layout in the flattened features, which matches
+        // what the vision encoder patch embedding expects (temporal slices first)
+        patches = patches.permute([0, 3, 6, 4, 7, 1, 2, 5, 8])?;
         let flattened_patches = patches.reshape((
             grid_t * grid_h * grid_w,
             channel * temporal_patch_size * patch_size * patch_size,
@@ -596,8 +606,10 @@ impl Qwen3VLImageProcessor {
 }
 
 impl ImagePreProcessor for Qwen3VLImageProcessor {
-    const DEFAULT_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
-    const DEFAULT_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+    // Qwen3-VL uses simple [-1, 1] normalization, NOT CLIP normalization
+    // See: https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct/raw/main/preprocessor_config.json
+    const DEFAULT_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
+    const DEFAULT_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
     fn preprocess(
         &self,

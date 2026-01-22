@@ -483,7 +483,8 @@ impl QMerger {
 /// Complete quantized Qwen3-VL vision encoder.
 /// Loaded from mmproj GGUF file.
 pub struct QQwen3VLVisionEncoder {
-    patch_embed_weight: Tensor,    // v.patch_embd.weight (conv kernel)
+    patch_embed_weight_0: Tensor,  // v.patch_embd.weight (temporal slice 0)
+    patch_embed_weight_1: Tensor,  // v.patch_embd.weight.1 (temporal slice 1)
     patch_embed_bias: Tensor,      // v.patch_embd.bias
     position_embed: Tensor,        // v.position_embd.weight
     blocks: Vec<QVisionBlock>,     // v.blk.{0-26}.*
@@ -566,8 +567,11 @@ impl QQwen3VLVisionEncoder {
         );
 
         // Load patch embedding (conv weights)
-        let patch_embed_weight = ct.tensor("v.patch_embd.weight", device)?.dequantize(device)?;
-        tracing::info!("Patch embed weight shape: {:?}", patch_embed_weight.dims());
+        // GGUF mmproj splits Conv3D into two Conv2D weights for temporal_patch_size=2
+        let patch_embed_weight_0 = ct.tensor("v.patch_embd.weight", device)?.dequantize(device)?;
+        tracing::info!("Patch embed weight_0 shape: {:?}", patch_embed_weight_0.dims());
+        let patch_embed_weight_1 = ct.tensor("v.patch_embd.weight.1", device)?.dequantize(device)?;
+        tracing::info!("Patch embed weight_1 shape: {:?}", patch_embed_weight_1.dims());
         let patch_embed_bias = ct.tensor("v.patch_embd.bias", device)?.dequantize(device)?;
         tracing::info!("Patch embed bias shape: {:?}", patch_embed_bias.dims());
 
@@ -601,7 +605,8 @@ impl QQwen3VLVisionEncoder {
         let merger = QMerger::load(ct, &config, device)?;
 
         Ok(Self {
-            patch_embed_weight,
+            patch_embed_weight_0,
+            patch_embed_weight_1,
             patch_embed_bias,
             position_embed,
             blocks,
@@ -887,58 +892,188 @@ impl QQwen3VLVisionEncoder {
         Tensor::cat(&all_embeds, 0)?.to_dtype(dtype)
     }
 
-    /// Apply 2D patch embedding (convolution)
-    /// OPTIMIZED: Uses native dtype (BF16/F16) - Metal GEMM kernels support these dtypes
+    /// Apply patch embedding using two Conv2D weights (from GGUF mmproj)
+    ///
+    /// GGUF mmproj splits the Conv3D kernel into two Conv2D kernels:
+    /// - v.patch_embd.weight: temporal slice 0
+    /// - v.patch_embd.weight.1: temporal slice 1
+    ///
+    /// The correct operation is: output = xs_t0 @ W0.T + xs_t1 @ W1.T + bias
+    /// where xs_t0/xs_t1 are the two temporal slices of the input.
     fn patch_embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // xs shape: [num_patches, patch_pixels] where patch_pixels = channels * temporal * H * W
-        // weight shape: [out_channels, in_channels, patch_h, patch_w] (4D conv kernel)
-        // GGUF mmproj uses 2D conv, so temporal is folded into batch dimension
+        let debug = std::env::var("MISTRALRS_DEBUG_VISION").is_ok();
 
-        // Use input dtype throughout - Metal supports BF16/F16 GEMM
+        // xs shape: [num_patches, C*T*H*W] where C=3, T=2, H=W=16
+        // Input features are ordered as [channel, temporal, h, w] from preprocessing
         let dtype = xs.dtype();
 
-        // Flatten conv weight from [out_channels, in_channels, H, W] to [out_channels, in_channels*H*W]
-        let weight_shape = self.patch_embed_weight.dims();
-        let out_channels = weight_shape[0];
-        let in_features: usize = weight_shape[1..].iter().product();
-
-        // Convert weight and bias to match input dtype (avoids F32 round-trip)
-        let weight = self.patch_embed_weight.to_dtype(dtype)?;
-        let bias = self.patch_embed_bias.to_dtype(dtype)?;
-        let weight_flat = weight.reshape((out_channels, in_features))?;
-
-        // Input has shape [num_patches, in_features * temporal] where temporal features are interleaved
-        // For GGUF 2D conv (converted from 3D), we process each temporal slice and sum
-        let xs_shape = xs.dims();
-        let num_patches = xs_shape[0];
-        let total_features = xs_shape[1];
-
-        // Determine temporal factor from mismatch between input features and weight features
-        let temporal = total_features / in_features;
-        if total_features % in_features != 0 {
-            candle_core::bail!(
-                "Input features {} not divisible by weight in_features {}",
-                total_features,
-                in_features
-            );
+        if debug {
+            let xs_f32 = xs.to_dtype(candle_core::DType::F32)?;
+            let xs_mean = xs_f32.mean_all()?.to_scalar::<f32>()?;
+            let xs_var = xs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG] patch_embed_forward INPUT:");
+            eprintln!("  xs shape: {:?}, dtype: {:?}", xs.dims(), xs.dtype());
+            eprintln!("  xs mean: {:.6}, std: {:.6}", xs_mean, xs_var.sqrt());
+            // Print first few values
+            let first_vals: Vec<f32> = xs_f32.flatten_all()?.narrow(0, 0, 10.min(xs_f32.elem_count()))?.to_vec1()?;
+            eprintln!("  xs first 10 values: {:?}", first_vals);
         }
 
-        // OPTIMIZED: Batch matmul instead of temporal loop
-        // Reshape to [num_patches * temporal, in_features] for single matmul
-        let xs_flat = xs.reshape((num_patches * temporal, in_features))?;
+        // Weight shape: [out_channels, in_channels, H, W] = [1024, 3, 16, 16]
+        let weight_shape = self.patch_embed_weight_0.dims();
+        let out_channels = weight_shape[0];
+        let in_channels = weight_shape[1];
+        let patch_h = weight_shape[2];
+        let patch_w = weight_shape[3];
+        let hw = patch_h * patch_w;  // 256
+        let in_features = in_channels * hw;  // 768 = 3 * 16 * 16
 
-        // Single matmul in native dtype (F16/BF16) - no F32 conversion needed on Metal
-        let weight_t = weight_flat.t()?;
-        let projected = xs_flat.matmul(&weight_t)?; // [num_patches * temporal, out_channels]
+        if debug {
+            eprintln!("  weight_0 shape: {:?}", self.patch_embed_weight_0.dims());
+            eprintln!("  weight_1 shape: {:?}", self.patch_embed_weight_1.dims());
+            eprintln!("  out_channels={}, in_channels={}, hw={}, in_features={}", out_channels, in_channels, hw, in_features);
+        }
 
-        // Reshape and sum over temporal dimension
-        // [num_patches * temporal, out_channels] -> [num_patches, temporal, out_channels] -> sum -> [num_patches, out_channels]
-        let out = projected
-            .reshape((num_patches, temporal, out_channels))?
-            .sum(1)?; // Sum over temporal dimension
+        // Convert weights and bias to input dtype
+        // Use contiguous() to ensure GGUF-loaded weights have proper memory layout
+        let weight_0 = self.patch_embed_weight_0.to_dtype(dtype)?.contiguous()?;
+        let weight_1 = self.patch_embed_weight_1.to_dtype(dtype)?.contiguous()?;
+        let bias = self.patch_embed_bias.to_dtype(dtype)?;
 
-        // Apply bias and return (already in native dtype)
-        out.broadcast_add(&bias)
+        if debug {
+            let w0_f32 = weight_0.to_dtype(candle_core::DType::F32)?;
+            let w1_f32 = weight_1.to_dtype(candle_core::DType::F32)?;
+            let w0_mean = w0_f32.mean_all()?.to_scalar::<f32>()?;
+            let w1_mean = w1_f32.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("  weight_0 mean: {:.6}, weight_1 mean: {:.6}", w0_mean, w1_mean);
+        }
+
+        // Flatten weights: [O, C, H, W] -> [O, C*H*W]
+        let w0_flat = weight_0.reshape((out_channels, in_features))?;
+        let w1_flat = weight_1.reshape((out_channels, in_features))?;
+
+        // Input shape
+        let num_patches = xs.dims()[0];
+        let total_features = xs.dims()[1];
+        let temporal = 2usize;
+        let expected_features = in_channels * temporal * hw;  // 3 * 2 * 256 = 1536
+
+        if debug {
+            eprintln!("  num_patches={}, total_features={}, expected={}", num_patches, total_features, expected_features);
+        }
+
+        // Validate input shape
+        if total_features != expected_features {
+            if debug {
+                eprintln!("  WARNING: total_features ({}) != expected ({})", total_features, expected_features);
+            }
+        }
+
+        // Reshape input: [num_patches, C*T*H*W] -> [num_patches, C, T, H*W]
+        // Features are in [channel, temporal, h, w] order from preprocessing (C=3, T=2, H=W=16)
+        // The preprocessing permutation puts channel before temporal!
+        let xs_reshaped = xs.reshape((num_patches, in_channels, temporal, hw))?;
+
+        // Extract temporal slices: [num_patches, C, T, H*W] -> select T dim -> [num_patches, C, H*W] -> flatten to [num_patches, C*H*W]
+        // Use contiguous() to ensure proper memory layout before reshape
+        let xs_t0 = xs_reshaped.i((.., .., 0, ..))?.contiguous()?.reshape((num_patches, in_features))?;
+        let xs_t1 = xs_reshaped.i((.., .., 1, ..))?.contiguous()?.reshape((num_patches, in_features))?;
+
+        if debug {
+            let t0_f32 = xs_t0.to_dtype(candle_core::DType::F32)?;
+            let t1_f32 = xs_t1.to_dtype(candle_core::DType::F32)?;
+            let t0_mean = t0_f32.mean_all()?.to_scalar::<f32>()?;
+            let t1_mean = t1_f32.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("  xs_t0 shape: {:?}, mean: {:.6}", xs_t0.dims(), t0_mean);
+            eprintln!("  xs_t1 shape: {:?}, mean: {:.6}", xs_t1.dims(), t1_mean);
+
+            // Verify: for [C, T, H*W] layout, channel boundaries should be at 256, 512
+            // xs_t0 should have: R[0:256], G[256:512], B[512:768]
+            let xs_orig_f32 = xs.to_dtype(candle_core::DType::F32)?;
+            let orig_first = xs_orig_f32.i(0)?.to_vec1::<f32>()?;
+            let t0_first = t0_f32.i(0)?.to_vec1::<f32>()?;
+
+            // Check if T=0 slice extracts correct positions from original
+            // With [C, T, H*W] layout: C0T0 is [0:256], C0T1 is [256:512], C1T0 is [512:768], etc.
+            eprintln!("  Verification - Original vs T0 extraction:");
+            eprintln!("    orig[0] (C0T0[0])  = {:.6}, t0[0] (should be C0T0[0]) = {:.6}", orig_first[0], t0_first[0]);
+            eprintln!("    orig[256] (C0T1[0]) = {:.6}, t0[256] (should be C1T0[0]) = {:.6}", orig_first[256], t0_first[256]);
+            eprintln!("    orig[512] (C1T0[0]) = {:.6}, t0[512] (should be C2T0[0]) = {:.6}", orig_first[512], t0_first[512]);
+            // C1T0[0] should be at orig position 512, and should appear at t0 position 256
+            eprintln!("    Expected t0[256] = orig[512] = {:.6}", orig_first[512]);
+
+            // Show first patch's values to understand layout
+            // xs_t0 has shape [num_patches, C*H*W] = [num_patches, 768]
+            let patch0 = t0_f32.i(0)?.to_vec1::<f32>()?;
+
+            // Hypothesis 1: Contiguous channels [R_all, G_all, B_all]
+            let r_mean_cont: f32 = patch0[0..256].iter().sum::<f32>() / 256.0;
+            let g_mean_cont: f32 = patch0[256..512].iter().sum::<f32>() / 256.0;
+            let b_mean_cont: f32 = patch0[512..768].iter().sum::<f32>() / 256.0;
+
+            // Hypothesis 2: Interleaved [R0,G0,B0,R1,G1,B1,...]
+            let mut r_sum = 0.0f32;
+            let mut g_sum = 0.0f32;
+            let mut b_sum = 0.0f32;
+            for i in 0..256 {
+                r_sum += patch0[i * 3];
+                g_sum += patch0[i * 3 + 1];
+                b_sum += patch0[i * 3 + 2];
+            }
+            let r_mean_int = r_sum / 256.0;
+            let g_mean_int = g_sum / 256.0;
+            let b_mean_int = b_sum / 256.0;
+
+            eprintln!("  Patch 0 (CONTIGUOUS [C,H*W]): R={:.3}, G={:.3}, B={:.3}", r_mean_cont, g_mean_cont, b_mean_cont);
+            eprintln!("  Patch 0 (INTERLEAVED [RGB,RGB,...]): R={:.3}, G={:.3}, B={:.3}", r_mean_int, g_mean_int, b_mean_int);
+
+            // Hypothesis 3: Layout is [H*W, C] not [C, H*W] - so 768 = 256 pixels * 3 channels
+            // Each position i has RGB triplet: patch0[i*3], patch0[i*3+1], patch0[i*3+2]
+            // Wait, that's same as interleaved. Let me try [H, W, C] style
+            // If 768 = 16*16*3, then groups of 3 are RGB values for each pixel
+            // First pixel: patch0[0..3], second pixel: patch0[3..6], etc.
+            // This is same as interleaved interpretation above.
+
+            // Let's check: are the first 256 values all unique or mostly same?
+            let unique_in_first_256: std::collections::HashSet<u32> = patch0[0..256]
+                .iter()
+                .map(|x| x.to_bits())
+                .collect();
+            eprintln!("  Unique values in first 256: {}", unique_in_first_256.len());
+
+            // Print every 256th value to see the pattern
+            eprintln!("  Values at pos 0, 256, 512: [{:.3}, {:.3}, {:.3}]", patch0[0], patch0[256], patch0[512]);
+            eprintln!("  Values at pos 1, 257, 513: [{:.3}, {:.3}, {:.3}]", patch0[1], patch0[257], patch0[513]);
+
+            eprintln!("  First 12 values: {:?}", &patch0[0..12]);
+        }
+
+        // Apply different weights to different temporal slices
+        // This matches Conv3D behavior: output = xs_t0 @ W0.T + xs_t1 @ W1.T
+        let out_t0 = xs_t0.matmul(&w0_flat.t()?)?;
+        let out_t1 = xs_t1.matmul(&w1_flat.t()?)?;
+
+        if debug {
+            let out0_f32 = out_t0.to_dtype(candle_core::DType::F32)?;
+            let out1_f32 = out_t1.to_dtype(candle_core::DType::F32)?;
+            let out0_mean = out0_f32.mean_all()?.to_scalar::<f32>()?;
+            let out1_mean = out1_f32.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("  out_t0 shape: {:?}, mean: {:.6}", out_t0.dims(), out0_mean);
+            eprintln!("  out_t1 shape: {:?}, mean: {:.6}", out_t1.dims(), out1_mean);
+        }
+
+        // Sum and add bias
+        let out = out_t0.add(&out_t1)?.broadcast_add(&bias)?;
+
+        if debug {
+            let out_f32 = out.to_dtype(candle_core::DType::F32)?;
+            let out_mean = out_f32.mean_all()?.to_scalar::<f32>()?;
+            let out_var = out_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG] patch_embed_forward OUTPUT:");
+            eprintln!("  out shape: {:?}, mean: {:.6}, std: {:.6}", out.dims(), out_mean, out_var.sqrt());
+        }
+
+        Ok(out)
     }
 
     /// Forward pass through the vision encoder.
@@ -952,6 +1087,15 @@ impl QQwen3VLVisionEncoder {
     pub fn forward(&self, pixel_values: &Tensor, grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
         let dtype = self.position_embed.dtype();
         let device = self.position_embed.device();
+        let debug = std::env::var("MISTRALRS_DEBUG_VISION").is_ok();
+
+        if debug {
+            eprintln!("\n[DEBUG] ========== VISION ENCODER FORWARD ==========");
+            eprintln!("  pixel_values shape: {:?}, dtype: {:?}", pixel_values.dims(), pixel_values.dtype());
+            eprintln!("  grid_thw shape: {:?}", grid_thw.dims());
+            let grid_vals: Vec<u32> = grid_thw.to_dtype(candle_core::DType::U32)?.flatten_all()?.to_vec1()?;
+            eprintln!("  grid_thw values: {:?}", grid_vals);
+        }
 
         // Timing instrumentation (enable via MISTRALRS_PROFILE_VISION=1)
         let profile = std::env::var("MISTRALRS_PROFILE_VISION").is_ok();
@@ -984,11 +1128,25 @@ impl QQwen3VLVisionEncoder {
         let xs = self.patch_embed_forward(&pixel_values.to_dtype(dtype)?)?;
         if profile { device.synchronize()?; timings.push(("patch_embed", t0.elapsed())); }
 
+        if debug {
+            let xs_f32 = xs.to_dtype(candle_core::DType::F32)?;
+            let xs_mean = xs_f32.mean_all()?.to_scalar::<f32>()?;
+            let xs_var = xs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG] After patch_embed: shape={:?}, mean={:.6}, std={:.6}", xs.dims(), xs_mean, xs_var.sqrt());
+        }
+
         // 2. Position embedding
         let t0 = std::time::Instant::now();
         let pos_embeds = self.interpolate_pos_embed(grid_thw)?;
         let mut hidden_states = xs.add(&pos_embeds)?;
         if profile { device.synchronize()?; timings.push(("pos_embed", t0.elapsed())); }
+
+        if debug {
+            let hs_f32 = hidden_states.to_dtype(candle_core::DType::F32)?;
+            let hs_mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
+            let hs_var = hs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG] After pos_embed: shape={:?}, mean={:.6}, std={:.6}", hidden_states.dims(), hs_mean, hs_var.sqrt());
+        }
 
         // 3. Rotary position embedding for attention
         // OPTIMIZED: Keep cos/sin in native dtype - Metal supports F16/BF16 for all RoPE ops
@@ -1020,10 +1178,24 @@ impl QQwen3VLVisionEncoder {
         }
         if profile { device.synchronize()?; timings.push(("transformer_blocks", t0.elapsed())); }
 
+        if debug {
+            let hs_f32 = hidden_states.to_dtype(candle_core::DType::F32)?;
+            let hs_mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
+            let hs_var = hs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG] After transformer_blocks: shape={:?}, mean={:.6}, std={:.6}", hidden_states.dims(), hs_mean, hs_var.sqrt());
+        }
+
         // 6. Post layer norm
         let t0 = std::time::Instant::now();
         hidden_states = self.post_ln.forward(&hidden_states)?;
         if profile { device.synchronize()?; timings.push(("post_ln", t0.elapsed())); }
+
+        if debug {
+            let hs_f32 = hidden_states.to_dtype(candle_core::DType::F32)?;
+            let hs_mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
+            let hs_var = hs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG] After post_ln: shape={:?}, mean={:.6}, std={:.6}", hidden_states.dims(), hs_mean, hs_var.sqrt());
+        }
 
         // Print timing summary
         if profile {
@@ -1038,6 +1210,14 @@ impl QQwen3VLVisionEncoder {
 
         // 7. Merger (projects to output dimension)
         let merged = self.merger.forward(&hidden_states)?;
+
+        if debug {
+            let m_f32 = merged.to_dtype(candle_core::DType::F32)?;
+            let m_mean = m_f32.mean_all()?.to_scalar::<f32>()?;
+            let m_var = m_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG] After merger (FINAL): shape={:?}, mean={:.6}, std={:.6}", merged.dims(), m_mean, m_var.sqrt());
+            eprintln!("[DEBUG] ========== END VISION ENCODER ==========\n");
+        }
 
         Ok((merged, deepstack_features))
     }

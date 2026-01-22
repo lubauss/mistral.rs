@@ -526,6 +526,48 @@ impl ModelWeights {
             // Convert to same dtype as input_embeds for compatibility
             let image_embeds = image_embeds.to_dtype(input_embeds.dtype())?;
 
+            // Scale vision embeddings to match text embedding magnitude
+            // GGUF quantized vision encoders often produce embeddings with different scale than text
+            let image_embeds = {
+                let scale_env = std::env::var("MISTRALRS_SCALE_VISION").unwrap_or_default();
+                let debug = std::env::var("MISTRALRS_DEBUG_VISION").is_ok();
+
+                let scale_factor: Option<f64> = match scale_env.to_lowercase().as_str() {
+                    "" | "none" | "0" | "false" => None,
+                    "adaptive" | "auto" => {
+                        // Compute scale based on text/vision std ratio
+                        let text_f32 = input_embeds.to_dtype(DType::F32)?;
+                        let vision_f32 = image_embeds.to_dtype(DType::F32)?;
+                        let text_std = text_f32.flatten_all()?.var(0)?.sqrt()?.to_scalar::<f32>()?;
+                        let vision_std = vision_f32.flatten_all()?.var(0)?.sqrt()?.to_scalar::<f32>()?;
+                        if vision_std > 1e-6 {
+                            Some((text_std / vision_std) as f64)
+                        } else {
+                            None
+                        }
+                    }
+                    s => s.parse::<f64>().ok(),
+                };
+
+                if debug {
+                    let text_f32 = input_embeds.to_dtype(DType::F32)?;
+                    let vision_f32 = image_embeds.to_dtype(DType::F32)?;
+                    let text_mean = text_f32.mean_all()?.to_scalar::<f32>()?;
+                    let text_std = text_f32.flatten_all()?.var(0)?.sqrt()?.to_scalar::<f32>()?;
+                    let vision_mean = vision_f32.mean_all()?.to_scalar::<f32>()?;
+                    let vision_std = vision_f32.flatten_all()?.var(0)?.sqrt()?.to_scalar::<f32>()?;
+                    eprintln!("[DEBUG] Text embeddings: mean={:.6}, std={:.6}", text_mean, text_std);
+                    eprintln!("[DEBUG] Vision embeddings: mean={:.6}, std={:.6}", vision_mean, vision_std);
+                    eprintln!("[DEBUG] Scale factor: {:?}", scale_factor);
+                }
+
+                if let Some(scale) = scale_factor {
+                    (image_embeds * scale)?
+                } else {
+                    image_embeds
+                }
+            };
+
             // Inject image embeddings at placeholder positions
             let mut offset = 0usize;
             for &(batch_idx, start, end) in image_positions {
