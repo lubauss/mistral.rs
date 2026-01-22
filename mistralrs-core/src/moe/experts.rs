@@ -42,12 +42,17 @@ impl MoEExpertsBackend {
         loading_isq: bool,
         quantization_config: &Option<QuantizedConfig>,
     ) -> Self {
+        // Use Fast backend for:
+        // - Metal devices (native gather support)
+        // - ISQ loading (weights loaded on CPU, then quantized and moved to GPU)
+        // - CUDA with quantization or ISQ
         let use_fast = device.is_metal()
-            || (device.is_cuda() && (loading_isq || quantization_config.is_some()));
+            || loading_isq  // ISQ loading uses CPU initially, then moves to GPU
+            || (device.is_cuda() && quantization_config.is_some());
 
         if use_fast {
             Self::Fast
-        } else if quantization_config.is_none() && !loading_isq && device.is_cuda() {
+        } else if quantization_config.is_none() && device.is_cuda() {
             Self::Fused
         } else {
             Self::Slow
