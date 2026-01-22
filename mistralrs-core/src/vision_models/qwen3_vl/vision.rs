@@ -158,6 +158,7 @@ impl VisionAttention {
         let mut k = qkv.i(1)?.squeeze(0)?;
         let mut v = qkv.i(2)?.squeeze(0)?;
 
+        // F32 conversion needed for RoPE precision
         let cos = cos.to_dtype(DType::F32)?;
         let sin = sin.to_dtype(DType::F32)?;
         q = q.to_dtype(DType::F32)?;
@@ -165,23 +166,19 @@ impl VisionAttention {
         v = v.to_dtype(DType::F32)?;
         (q, k) = apply_rotary_pos_emb_vision(&q, &k, &cos, &sin)?;
 
-        let mut outputs = Vec::new();
-        for window in cu_seqlens.windows(2) {
-            let start = window[0];
-            let end = window[1];
-            if end <= start {
-                continue;
-            }
-            let len = end - start;
-            let q_chunk = q.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
-            let k_chunk = k.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
-            let v_chunk = v.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
+        // OPTIMIZED: Fast path for single sequence (99% of inference cases)
+        // Avoids Vec allocation, loop overhead, and Tensor::cat
+        let attn_output = if cu_seqlens.len() == 2 {
+            // Single sequence - process directly without loop
+            let q_t = q.transpose(0, 1)?.unsqueeze(0)?;
+            let k_t = k.transpose(0, 1)?.unsqueeze(0)?;
+            let v_t = v.transpose(0, 1)?.unsqueeze(0)?;
 
-            let mut chunk_out = Sdpa
+            Sdpa
                 .run_attention(
-                    &q_chunk.unsqueeze(0)?,
-                    &k_chunk.unsqueeze(0)?,
-                    &v_chunk.unsqueeze(0)?,
+                    &q_t,
+                    &k_t,
+                    &v_t,
                     None,
                     None,
                     &SdpaParams {
@@ -192,12 +189,46 @@ impl VisionAttention {
                     },
                 )?
                 .squeeze(0)?
-                .transpose(0, 1)?;
-            chunk_out.device().synchronize()?;
-            chunk_out = chunk_out.reshape((len, self.num_heads * self.head_dim))?;
-            outputs.push(chunk_out.to_dtype(xs.dtype())?);
-        }
-        let attn_output = Tensor::cat(&outputs, 0)?;
+                .transpose(0, 1)?
+                .reshape((seq_len, self.num_heads * self.head_dim))?
+                .to_dtype(xs.dtype())?
+        } else {
+            // Multiple sequences - use chunked processing
+            let mut outputs = Vec::with_capacity(cu_seqlens.len() - 1);
+            for window in cu_seqlens.windows(2) {
+                let start = window[0];
+                let end = window[1];
+                if end <= start {
+                    continue;
+                }
+                let len = end - start;
+                // OPTIMIZED: Remove .contiguous() - Metal handles non-contiguous tensors
+                let q_chunk = q.narrow(0, start, len)?.transpose(0, 1)?.unsqueeze(0)?;
+                let k_chunk = k.narrow(0, start, len)?.transpose(0, 1)?.unsqueeze(0)?;
+                let v_chunk = v.narrow(0, start, len)?.transpose(0, 1)?.unsqueeze(0)?;
+
+                let chunk_out = Sdpa
+                    .run_attention(
+                        &q_chunk,
+                        &k_chunk,
+                        &v_chunk,
+                        None,
+                        None,
+                        &SdpaParams {
+                            n_kv_groups: 1,
+                            sliding_window: None,
+                            softcap: None,
+                            softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+                        },
+                    )?
+                    .squeeze(0)?
+                    .transpose(0, 1)?
+                    .reshape((len, self.num_heads * self.head_dim))?;
+                // OPTIMIZED: Removed device().synchronize() - was forcing CPU-GPU sync on every chunk
+                outputs.push(chunk_out.to_dtype(xs.dtype())?);
+            }
+            Tensor::cat(&outputs, 0)?
+        };
         self.proj.forward(&attn_output)
     }
 
@@ -618,6 +649,7 @@ impl Qwen3VLVisionModel {
         let seq_len = hidden_states.dim(0)?;
         let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
         let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
+        // F32 needed for RoPE precision
         let cos = emb.cos()?.to_dtype(DType::F32)?;
         let sin = emb.sin()?.to_dtype(DType::F32)?;
 
