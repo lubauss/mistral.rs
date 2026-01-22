@@ -170,7 +170,6 @@ impl QVisionAttention {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
-        let input_dtype = xs.dtype();
         let seq_len = xs.dim(0)?;
         let hidden_states = self.qkv.forward(xs)?;
 
@@ -185,42 +184,54 @@ impl QVisionAttention {
         // OPTIMIZED: RoPE in native dtype (F16/BF16) - Metal supports all ops
         let (q, k) = apply_rotary_pos_emb_vision(&q, &k, cos, sin)?;
 
-        // Process each sequence in the batch
-        // Note: Q, K now in input_dtype after RoPE; V stays in original dtype from QKV projection
-        let mut outputs = Vec::new();
-        for window in cu_seqlens.windows(2) {
-            let start = window[0];
-            let end = window[1];
-            if end <= start {
-                continue;
-            }
-            let len = end - start;
-            // SDPA requires contiguous tensors after transpose
-            let q_chunk = q.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
-            let k_chunk = k.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
-            let v_chunk = v.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
+        let sdpa_params = SdpaParams {
+            n_kv_groups: 1,
+            sliding_window: None,
+            softcap: None,
+            softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
+        };
 
-            // Run attention (SDPA supports BF16/F16 natively on Metal)
-            let chunk_out = Sdpa
-                .run_attention(
-                    &q_chunk.unsqueeze(0)?,
-                    &k_chunk.unsqueeze(0)?,
-                    &v_chunk.unsqueeze(0)?,
-                    None,
-                    None,
-                    &SdpaParams {
-                        n_kv_groups: 1,
-                        sliding_window: None,
-                        softcap: None,
-                        softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
-                    },
-                )?
+        // OPTIMIZED: Fast path for single sequence (most common case for single image)
+        // Avoids loop overhead, Vec allocation, and Tensor::cat
+        let attn_output = if cu_seqlens.len() == 2 {
+            // Single sequence: process directly without loop
+            // Shape: [seq_len, num_heads, head_dim] -> [1, num_heads, seq_len, head_dim]
+            let q_t = q.transpose(0, 1)?.unsqueeze(0)?;
+            let k_t = k.transpose(0, 1)?.unsqueeze(0)?;
+            let v_t = v.transpose(0, 1)?.unsqueeze(0)?;
+
+            Sdpa
+                .run_attention(&q_t, &k_t, &v_t, None, None, &sdpa_params)?
                 .squeeze(0)?
                 .transpose(0, 1)?
-                .reshape((len, self.num_heads * self.head_dim))?;
-            outputs.push(chunk_out);
-        }
-        let attn_output = Tensor::cat(&outputs, 0)?;
+                .reshape((seq_len, self.num_heads * self.head_dim))?
+        } else {
+            // Multiple sequences: process each separately
+            // This path is rare for single-image inference
+            let mut outputs = Vec::with_capacity(cu_seqlens.len() - 1);
+            for window in cu_seqlens.windows(2) {
+                let start = window[0];
+                let end = window[1];
+                if end <= start {
+                    continue;
+                }
+                let len = end - start;
+
+                // OPTIMIZED: Transpose once, then narrow (avoids contiguous on full tensor)
+                let q_chunk = q.narrow(0, start, len)?.transpose(0, 1)?.unsqueeze(0)?;
+                let k_chunk = k.narrow(0, start, len)?.transpose(0, 1)?.unsqueeze(0)?;
+                let v_chunk = v.narrow(0, start, len)?.transpose(0, 1)?.unsqueeze(0)?;
+
+                let chunk_out = Sdpa
+                    .run_attention(&q_chunk, &k_chunk, &v_chunk, None, None, &sdpa_params)?
+                    .squeeze(0)?
+                    .transpose(0, 1)?
+                    .reshape((len, self.num_heads * self.head_dim))?;
+                outputs.push(chunk_out);
+            }
+            Tensor::cat(&outputs, 0)?
+        };
+
         self.proj.forward(&attn_output)
     }
 }
@@ -312,15 +323,16 @@ impl QVisionBlock {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
-        let residual = xs.clone();
-        let xs = self.ln1.forward(xs)?;
-        let xs = self.attn.forward(&xs, cu_seqlens, cos, sin)?;
-        let xs = (residual + xs)?;
+        // OPTIMIZED: Use references for residual instead of clone where possible
+        // First residual block: attention
+        let normed = self.ln1.forward(xs)?;
+        let attn_out = self.attn.forward(&normed, cu_seqlens, cos, sin)?;
+        let xs = (xs + attn_out)?;  // xs is consumed here, no clone needed
 
-        let residual = xs.clone();
-        let xs = self.ln2.forward(&xs)?;
-        let xs = self.mlp.forward(&xs)?;
-        residual + xs
+        // Second residual block: MLP
+        let normed = self.ln2.forward(&xs)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        &xs + mlp_out  // Return reference add to avoid clone
     }
 }
 
@@ -772,22 +784,14 @@ impl QQwen3VLVisionEncoder {
     }
 
     /// Interpolate position embeddings for variable resolution
+    /// OPTIMIZED: Uses batched tensor operations instead of per-position loops
     fn interpolate_pos_embed(&self, grid_thw: &Tensor) -> Result<Tensor> {
         let dtype = self.position_embed.dtype();
+        let device = self.position_embed.device();
         let grid = grid_thw.to_vec2::<u32>()?;
         let num_grid = self.num_grid_per_side();
         let hidden_size = self.config.embedding_length;
         let merge_size = self.config.spatial_merge_size;
-
-        // Simple bilinear interpolation for position embeddings
-        let linspace = |steps: usize| -> Vec<f32> {
-            if steps == 1 {
-                return vec![0.0];
-            }
-            let max_val = (num_grid - 1) as f32;
-            let step = max_val / (steps.saturating_sub(1)) as f32;
-            (0..steps).map(|i| i as f32 * step).collect()
-        };
 
         let mut all_embeds = Vec::new();
         for g in &grid {
@@ -795,50 +799,76 @@ impl QQwen3VLVisionEncoder {
             let h = g[1] as usize;
             let w = g[2] as usize;
 
-            let h_vals = linspace(h);
-            let w_vals = linspace(w);
+            // Compute interpolation coordinates and weights using tensor ops
+            // linspace: generate interpolation coordinates
+            let max_val = (num_grid - 1) as f32;
+            let h_step = if h > 1 { max_val / (h - 1) as f32 } else { 0.0 };
+            let w_step = if w > 1 { max_val / (w - 1) as f32 } else { 0.0 };
 
-            let mut pos_indices = Vec::with_capacity(h * w);
-            let mut weights = Vec::with_capacity(h * w * 4);
+            // Build indices and weights for all h*w positions at once
+            let hw = h * w;
+            let mut idx00_vec = Vec::with_capacity(hw);
+            let mut idx01_vec = Vec::with_capacity(hw);
+            let mut idx10_vec = Vec::with_capacity(hw);
+            let mut idx11_vec = Vec::with_capacity(hw);
+            let mut w00_vec = Vec::with_capacity(hw);
+            let mut w01_vec = Vec::with_capacity(hw);
+            let mut w10_vec = Vec::with_capacity(hw);
+            let mut w11_vec = Vec::with_capacity(hw);
 
-            for &hv in &h_vals {
-                for &wv in &w_vals {
-                    let h_floor = hv.floor() as usize;
+            for hi in 0..h {
+                let hv = hi as f32 * h_step;
+                let h_floor = hv.floor() as usize;
+                let h_ceil = (hv.ceil() as usize).min(num_grid - 1);
+                let dh = hv - h_floor as f32;
+
+                for wi in 0..w {
+                    let wv = wi as f32 * w_step;
                     let w_floor = wv.floor() as usize;
-                    let h_ceil = (hv.ceil() as usize).min(num_grid - 1);
                     let w_ceil = (wv.ceil() as usize).min(num_grid - 1);
-
-                    let dh = hv - h_floor as f32;
                     let dw = wv - w_floor as f32;
 
-                    // Indices for 4 corners
-                    let idx00 = h_floor * num_grid + w_floor;
-                    let idx01 = h_floor * num_grid + w_ceil;
-                    let idx10 = h_ceil * num_grid + w_floor;
-                    let idx11 = h_ceil * num_grid + w_ceil;
+                    idx00_vec.push((h_floor * num_grid + w_floor) as u32);
+                    idx01_vec.push((h_floor * num_grid + w_ceil) as u32);
+                    idx10_vec.push((h_ceil * num_grid + w_floor) as u32);
+                    idx11_vec.push((h_ceil * num_grid + w_ceil) as u32);
 
-                    pos_indices.push((idx00, idx01, idx10, idx11));
-                    weights.push(((1.0 - dh) * (1.0 - dw), (1.0 - dh) * dw, dh * (1.0 - dw), dh * dw));
+                    w00_vec.push((1.0 - dh) * (1.0 - dw));
+                    w01_vec.push((1.0 - dh) * dw);
+                    w10_vec.push(dh * (1.0 - dw));
+                    w11_vec.push(dh * dw);
                 }
             }
 
-            // For each position, interpolate from the 4 corners
-            let mut interpolated = Vec::with_capacity(h * w);
-            for ((idx00, idx01, idx10, idx11), (w00, w01, w10, w11)) in pos_indices.iter().zip(weights.iter()) {
-                let p00 = self.position_embed.i(*idx00)?;
-                let p01 = self.position_embed.i(*idx01)?;
-                let p10 = self.position_embed.i(*idx10)?;
-                let p11 = self.position_embed.i(*idx11)?;
+            // Create index tensors and gather all corners in batch
+            let idx00 = Tensor::from_vec(idx00_vec, hw, device)?;
+            let idx01 = Tensor::from_vec(idx01_vec, hw, device)?;
+            let idx10 = Tensor::from_vec(idx10_vec, hw, device)?;
+            let idx11 = Tensor::from_vec(idx11_vec, hw, device)?;
 
-                let interp = ((p00 * *w00 as f64)? + (p01 * *w01 as f64)? + (p10 * *w10 as f64)? + (p11 * *w11 as f64)?)?;
-                interpolated.push(interp);
-            }
+            // Batch gather: [hw, hidden_size] for each corner
+            let p00 = self.position_embed.index_select(&idx00, 0)?;
+            let p01 = self.position_embed.index_select(&idx01, 0)?;
+            let p10 = self.position_embed.index_select(&idx10, 0)?;
+            let p11 = self.position_embed.index_select(&idx11, 0)?;
 
-            // Stack and repeat for temporal dimension
-            let pos_embed_hw = Tensor::stack(&interpolated.iter().collect::<Vec<_>>(), 0)?;
+            // Create weight tensors and broadcast multiply
+            let w00 = Tensor::from_vec(w00_vec, (hw, 1), device)?.to_dtype(dtype)?;
+            let w01 = Tensor::from_vec(w01_vec, (hw, 1), device)?.to_dtype(dtype)?;
+            let w10 = Tensor::from_vec(w10_vec, (hw, 1), device)?.to_dtype(dtype)?;
+            let w11 = Tensor::from_vec(w11_vec, (hw, 1), device)?.to_dtype(dtype)?;
+
+            // Weighted sum: [hw, hidden_size]
+            let pos_embed_hw = ((p00.broadcast_mul(&w00)?
+                + p01.broadcast_mul(&w01)?)?
+                + p10.broadcast_mul(&w10)?)?
+                .broadcast_add(&p11.broadcast_mul(&w11)?)?;
+
+            // Repeat for temporal dimension: [hw, hidden] -> [t*hw, hidden]
             let pos_embed_thw = pos_embed_hw.repeat((t, 1))?;
 
-            // Permute for spatial merge
+            // Permute for spatial merge: reorder to interleave merge blocks
+            // [t*h*w, hidden] -> [t, h/m, m, w/m, m, hidden] -> permute -> [t, h/m, w/m, m, m, hidden] -> [t*h*w, hidden]
             let pos_embed = pos_embed_thw.reshape((
                 t,
                 h / merge_size,
@@ -849,6 +879,7 @@ impl QQwen3VLVisionEncoder {
             ))?;
             let pos_embed = pos_embed
                 .permute((0, 1, 3, 2, 4, 5))?
+                .contiguous()?  // Make contiguous after permute for efficient reshape
                 .reshape((t * h * w, hidden_size))?;
             all_embeds.push(pos_embed);
         }
@@ -920,6 +951,12 @@ impl QQwen3VLVisionEncoder {
     ///     (merged_embeddings, deepstack_features)
     pub fn forward(&self, pixel_values: &Tensor, grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
         let dtype = self.position_embed.dtype();
+        let device = self.position_embed.device();
+
+        // Timing instrumentation (enable via MISTRALRS_PROFILE_VISION=1)
+        let profile = std::env::var("MISTRALRS_PROFILE_VISION").is_ok();
+        let mut timings: Vec<(&str, std::time::Duration)> = Vec::new();
+        let total_start = std::time::Instant::now();
 
         // Flatten pixel_values from [batch, num_images, num_patches, features] to [total_patches, features]
         let pixel_values = match pixel_values.dims().len() {
@@ -943,14 +980,19 @@ impl QQwen3VLVisionEncoder {
         };
 
         // 1. Patch embedding
+        let t0 = std::time::Instant::now();
         let xs = self.patch_embed_forward(&pixel_values.to_dtype(dtype)?)?;
+        if profile { device.synchronize()?; timings.push(("patch_embed", t0.elapsed())); }
 
         // 2. Position embedding
+        let t0 = std::time::Instant::now();
         let pos_embeds = self.interpolate_pos_embed(grid_thw)?;
         let mut hidden_states = xs.add(&pos_embeds)?;
+        if profile { device.synchronize()?; timings.push(("pos_embed", t0.elapsed())); }
 
         // 3. Rotary position embedding for attention
         // OPTIMIZED: Keep cos/sin in native dtype - Metal supports F16/BF16 for all RoPE ops
+        let t0 = std::time::Instant::now();
         let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
         let seq_len = hidden_states.dim(0)?;
         let head_dim = self.config.embedding_length / self.config.num_heads;
@@ -959,11 +1001,13 @@ impl QQwen3VLVisionEncoder {
         // Keep in hidden_states dtype (F16) - no F32 conversion needed
         let cos = rotary_pos_emb.cos()?.to_dtype(hidden_states.dtype())?;
         let sin = rotary_pos_emb.sin()?.to_dtype(hidden_states.dtype())?;
+        if profile { device.synchronize()?; timings.push(("rope_coords", t0.elapsed())); }
 
         // 4. Build cumulative sequence lengths
         let cu_seqlens = self.build_cu_seqlens(grid_thw)?;
 
         // 5. Process through transformer blocks with deepstack
+        let t0 = std::time::Instant::now();
         let mut deepstack_features = Vec::new();
         for (layer_idx, block) in self.blocks.iter().enumerate() {
             hidden_states = block.forward(&hidden_states, &cu_seqlens, &cos, &sin)?;
@@ -974,9 +1018,23 @@ impl QQwen3VLVisionEncoder {
                 deepstack_features.push(feat);
             }
         }
+        if profile { device.synchronize()?; timings.push(("transformer_blocks", t0.elapsed())); }
 
         // 6. Post layer norm
+        let t0 = std::time::Instant::now();
         hidden_states = self.post_ln.forward(&hidden_states)?;
+        if profile { device.synchronize()?; timings.push(("post_ln", t0.elapsed())); }
+
+        // Print timing summary
+        if profile {
+            let total = total_start.elapsed();
+            tracing::info!("Vision encoder timing breakdown ({} tokens):", seq_len);
+            for (name, dur) in &timings {
+                let pct = dur.as_secs_f64() / total.as_secs_f64() * 100.0;
+                tracing::info!("  {:<20} {:>8.2}ms ({:>5.1}%)", name, dur.as_secs_f64() * 1000.0, pct);
+            }
+            tracing::info!("  {:<20} {:>8.2}ms", "TOTAL", total.as_secs_f64() * 1000.0);
+        }
 
         // 7. Merger (projects to output dimension)
         let merged = self.merger.forward(&hidden_states)?;
