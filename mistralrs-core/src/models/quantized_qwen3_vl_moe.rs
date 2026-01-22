@@ -56,14 +56,10 @@ struct FusedMoe {
     down_experts: QMatMul,
     norm_topk_prob: bool,
     num_experts_per_tok: usize,
-    // Cached dequantized weights for Metal (None if CUDA)
-    cached_gate_w: Option<Tensor>,
-    cached_up_w: Option<Tensor>,
-    cached_down_w: Option<Tensor>,
 }
 
 impl FusedMoe {
-    /// Create FusedMoe with optional weight caching for Metal.
+    /// Create FusedMoe - now uses native indexed_moe_forward on both CUDA and Metal.
     fn new(
         gate: QMatMul,
         gate_experts: QMatMul,
@@ -71,22 +67,9 @@ impl FusedMoe {
         down_experts: QMatMul,
         norm_topk_prob: bool,
         num_experts_per_tok: usize,
-        device: &Device,
+        _device: &Device,
     ) -> Result<Self> {
-        // Pre-dequantize expert weights for Metal (avoids per-forward dequantization)
-        let (cached_gate_w, cached_up_w, cached_down_w) = if matches!(device, Device::Metal(_)) {
-            tracing::info!(
-                "Pre-dequantizing MoE expert weights for Metal (this uses more memory but faster inference)"
-            );
-            (
-                Some(gate_experts.dequantize_f16()?),
-                Some(up_experts.dequantize_f16()?),
-                Some(down_experts.dequantize_f16()?),
-            )
-        } else {
-            (None, None, None)
-        };
-
+        // No longer need to pre-dequantize for Metal - we have native kernel support!
         Ok(Self {
             gate,
             gate_experts,
@@ -94,54 +77,7 @@ impl FusedMoe {
             down_experts,
             norm_topk_prob,
             num_experts_per_tok,
-            cached_gate_w,
-            cached_up_w,
-            cached_down_w,
         })
-    }
-
-    /// Metal-compatible MoE forward using cached dequantized weights + gather_mm.
-    fn forward_metal_fallback(
-        &self,
-        xs: &Tensor,
-        indices: &Tensor,
-        num_tokens: usize,
-        hidden_dim: usize,
-    ) -> Result<Tensor> {
-        let k = self.num_experts_per_tok;
-
-        // Use cached dequantized weights (should always be Some on Metal)
-        let gate_w = self.cached_gate_w.as_ref().expect("Missing cached gate weights for Metal");
-        let up_w = self.cached_up_w.as_ref().expect("Missing cached up weights for Metal");
-        let down_w = self.cached_down_w.as_ref().expect("Missing cached down weights for Metal");
-
-        // Expand xs from [num_tokens, hidden_dim] to [num_tokens * k, hidden_dim]
-        // by broadcasting each token to all its selected experts
-        let xs_f16 = xs.to_dtype(DType::F16)?;
-        let xs_expanded = xs_f16
-            .unsqueeze(1)? // [num_tokens, 1, hidden_dim]
-            .broadcast_as((num_tokens, k, hidden_dim))?
-            .reshape((num_tokens * k, hidden_dim))?
-            .contiguous()?;
-
-        // Flatten indices from [num_tokens, k] to [num_tokens * k]
-        let flat_indices = indices.reshape((num_tokens * k,))?.to_dtype(DType::U32)?;
-
-        // gate_mm: [num_tokens * k, hidden_dim] @ [num_experts, intermediate, hidden_dim]
-        let gate_out = xs_expanded.gather_mm(gate_w, &flat_indices)?;
-        // up_mm: same dimensions
-        let up_out = xs_expanded.gather_mm(up_w, &flat_indices)?;
-
-        // SiLU activation: silu(gate) * up
-        let activated =
-            crate::ops::mul_and_act(&gate_out, &up_out, crate::layers::Activation::Silu)?;
-
-        // down_mm: [num_tokens * k, intermediate_dim] @ [num_experts, hidden_dim, intermediate_dim]
-        let down_out = activated.gather_mm(down_w, &flat_indices)?;
-
-        // Reshape back to [num_tokens, k, hidden_dim]
-        let (_m, out_dim) = down_out.dims2()?;
-        down_out.reshape((num_tokens, k, out_dim))
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -161,25 +97,13 @@ impl FusedMoe {
             scores = scores.broadcast_div(&scores.sum_keepdim(D::Minus1)?)?;
         }
 
-        // Check if we're on Metal - use fallback since indexed_moe_forward is CUDA-only
-        let is_metal = matches!(xs.device(), Device::Metal(_));
-
-        let (ys, scores) = if is_metal {
-            // Metal fallback: dequantize + gather_mm (outputs F16)
-            let ys = self.forward_metal_fallback(&xs, &indices, num_tokens, hidden_dim)?;
-            // Convert scores to F16 to match ys dtype
-            let scores = scores.to_dtype(DType::F16)?;
-            (ys, scores)
-        } else {
-            // CUDA path: use indexed_moe_forward (faster)
-            let xs = xs.reshape((num_tokens, 1, hidden_dim))?;
-            let gate = self.gate_experts.indexed_moe_forward(&xs, &indices)?;
-            let up = self.up_experts.indexed_moe_forward(&xs, &indices)?;
-            let activated = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
-            let ys = self.down_experts
-                .indexed_moe_forward(&activated, &indices)?;
-            (ys, scores)
-        };
+        // Use indexed_moe_forward for both CUDA and Metal
+        // Metal now has native kernel support via kernel_mul_mm_id
+        let xs = xs.reshape((num_tokens, 1, hidden_dim))?;
+        let gate = self.gate_experts.indexed_moe_forward(&xs, &indices)?;
+        let up = self.up_experts.indexed_moe_forward(&xs, &indices)?;
+        let activated = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
+        let ys = self.down_experts.indexed_moe_forward(&activated, &indices)?;
 
         ys.broadcast_mul(&scores.unsqueeze(D::Minus1)?)?
             .sum(D::Minus2)?
