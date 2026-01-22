@@ -79,9 +79,21 @@ impl QuantMethod for GgufMatMul {
         #[cfg(feature = "cuda")]
         let res = cuda::qmatmul_indexed_moe_forward(&self.w, x, indices)?;
 
-        // For CPU and Metal: use dequantize-then-matmul approach
+        // For Metal: use candle's fused kernel_mul_mm_id kernel
+        // For CPU: use dequantize-then-matmul approach
         #[cfg(not(feature = "cuda"))]
-        let res = cpu::cpu_indexed_moe_forward(&self.w, x, indices)?;
+        let res = {
+            if x.device().is_metal() {
+                // Metal has native fused kernel support via kernel_mul_mm_id
+                // Convert input to F32 as required by the Metal kernel
+                let x_f32 = x.to_dtype(DType::F32)?;
+                // Convert indices to I32 as expected by the kernel
+                let indices_i32 = indices.to_dtype(DType::I32)?;
+                self.w.indexed_moe_forward(&x_f32, &indices_i32)?
+            } else {
+                cpu::cpu_indexed_moe_forward(&self.w, x, indices)?
+            }
+        };
 
         if let Some(ref b) = self.b {
             res.broadcast_add(b)
