@@ -42,12 +42,18 @@ impl MoEExpertsBackend {
         loading_isq: bool,
         quantization_config: &Option<QuantizedConfig>,
     ) -> Self {
+        // Check if immediate ISQ is enabled (set via set_immediate_isq_with_overrides)
+        // This happens when ISQ is applied during tensor loading rather than as a post-step
+        let immediate_isq_enabled = mistralrs_quant::get_immediate_isq().is_some();
+
         // Use Fast backend for:
         // - Metal devices (native gather support)
         // - ISQ loading (weights loaded on CPU, then quantized and moved to GPU)
+        // - Immediate ISQ (weights quantized during loading via apply_immediate_isq)
         // - CUDA with quantization or ISQ
         let use_fast = device.is_metal()
             || loading_isq  // ISQ loading uses CPU initially, then moves to GPU
+            || immediate_isq_enabled  // Immediate ISQ quantizes during tensor loading
             || (device.is_cuda() && quantization_config.is_some());
 
         if use_fast {
