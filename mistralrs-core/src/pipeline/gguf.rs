@@ -46,6 +46,7 @@ use crate::{
     models::quantized_qwen3::ModelWeights as QQwen3,
     models::quantized_qwen3_moe::ModelWeights as QQwen3MoE,
     models::quantized_qwen3_vl::ModelWeights as QQwen3Vl,
+    models::quantized_qwen3_vl_moe::ModelWeights as QQwen3VlMoE,
     models::quantized_qwen3_vl_vision::QQwen3VLVisionEncoder,
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
     utils::tokens::get_token,
@@ -77,11 +78,12 @@ enum Model {
     Qwen3(QQwen3),
     Qwen3MoE(QQwen3MoE),
     Qwen3Vl(QQwen3Vl),
+    Qwen3VlMoE(QQwen3VlMoE),
 }
 
 impl Model {
     fn is_vision(&self) -> bool {
-        matches!(self, Model::Qwen3Vl(_))
+        matches!(self, Model::Qwen3Vl(_) | Model::Qwen3VlMoE(_))
     }
 }
 
@@ -526,14 +528,21 @@ impl Loader for GGUFLoader {
                         vision_config.spatial_merge_size
                     );
 
-                    // Load LLM text model using standard TryFrom pattern
-                    let mut llm_model = QQwen3Vl::try_from(model_config)?;
-
-                    // Attach vision encoder to LLM
-                    llm_model.set_vision_encoder(vision_encoder);
-                    info!("Vision encoder attached to LLM model");
-
-                    Model::Qwen3Vl(llm_model)
+                    // Load LLM text model - use MoE variant for qwen3vlmoe
+                    match arch {
+                        GGUFArchitecture::Qwen3VlMoE => {
+                            let mut llm_model = QQwen3VlMoE::try_from(model_config)?;
+                            llm_model.set_vision_encoder(vision_encoder);
+                            info!("Vision encoder attached to MoE LLM model");
+                            Model::Qwen3VlMoE(llm_model)
+                        }
+                        _ => {
+                            let mut llm_model = QQwen3Vl::try_from(model_config)?;
+                            llm_model.set_vision_encoder(vision_encoder);
+                            info!("Vision encoder attached to LLM model");
+                            Model::Qwen3Vl(llm_model)
+                        }
+                    }
                 }
                 GGUFArchitecture::Clip => {
                     bail!("CLIP architecture is for mmproj files only, not standalone models. \
@@ -602,6 +611,7 @@ impl Loader for GGUFLoader {
             Model::Qwen3(ref p) => p.max_seq_len,
             Model::Qwen3MoE(ref p) => p.max_seq_len,
             Model::Qwen3Vl(ref p) => p.max_seq_len,
+            Model::Qwen3VlMoE(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
@@ -615,6 +625,7 @@ impl Loader for GGUFLoader {
             Model::Qwen3(ref model) => model.cache.normal().0.len(),
             Model::Qwen3MoE(ref model) => model.cache.normal().0.len(),
             Model::Qwen3Vl(ref model) => model.cache.normal().0.len(),
+            Model::Qwen3VlMoE(ref model) => model.cache.normal().0.len(),
         };
 
         if chat_template.bos_token.is_none() {
@@ -782,6 +793,7 @@ impl CacheManagerMixin for GGUFPipeline {
             Model::Qwen3(ref model) => &model.cache,
             Model::Qwen3MoE(ref model) => &model.cache,
             Model::Qwen3Vl(ref model) => &model.cache,
+            Model::Qwen3VlMoE(ref model) => &model.cache,
         }
     }
 }
@@ -799,6 +811,7 @@ impl MetadataMixin for GGUFPipeline {
             Model::Qwen3(ref model) => model.device.clone(),
             Model::Qwen3MoE(ref model) => model.device.clone(),
             Model::Qwen3Vl(ref model) => model.device.clone(),
+            Model::Qwen3VlMoE(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -872,6 +885,37 @@ impl Pipeline for GGUFPipeline {
 
                         // Build image_positions from continuous_img_pad
                         // Format: (batch_idx, start_pos, end_pos)
+                        let mut image_positions = Vec::new();
+                        for (batch_idx, pads) in continuous_img_pad.iter().enumerate() {
+                            for (start, end) in pads {
+                                image_positions.push((batch_idx, *start, *end));
+                            }
+                        }
+
+                        model.forward_with_vision(
+                            &input_ids,
+                            pixel_values.as_ref(),
+                            image_grid_thw.as_ref(),
+                            &image_positions,
+                            &seqlen_offsets,
+                            context_lens,
+                            paged_attn_meta,
+                        )?
+                    }
+                    Model::Qwen3VlMoE(model) => {
+                        // Extract vision-specific args
+                        let Qwen3VLVisionSpecificArgs {
+                            input_ids_full: _,
+                            image_grid_thw,
+                            video_grid_thw: _,
+                            seqlens: _,
+                            continuous_img_pad,
+                            continuous_vid_pad: _,
+                        } = *model_specific_args
+                            .downcast()
+                            .expect("Cannot downcast into Qwen3VLVisionSpecificArgs");
+
+                        // Build image_positions from continuous_img_pad
                         let mut image_positions = Vec::new();
                         for (batch_idx, pads) in continuous_img_pad.iter().enumerate() {
                             for (start, end) in pads {
@@ -967,6 +1011,10 @@ impl Pipeline for GGUFPipeline {
                     model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
                 }
                 Model::Qwen3Vl(ref model) => {
+                    // Text-only forward (no images in this request)
+                    model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                }
+                Model::Qwen3VlMoE(ref model) => {
                     // Text-only forward (no images in this request)
                     model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
                 }
