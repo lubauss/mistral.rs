@@ -1,7 +1,20 @@
+//! Quantized Qwen3-VL MoE Model combining GGUF LLM with vision encoder.
+//!
+//! This model loads:
+//! - LLM weights from main GGUF file (qwen3vlmoe architecture, `blk.{i}.*` tensors with MoE experts)
+//! - Vision encoder from mmproj GGUF file (clip architecture, `v.blk.{i}.*` tensors)
+//!
+//! Architecture: qwen3vlmoe (Qwen3-VL-30B-A3B and similar MoE vision models)
+
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use candle_core::quantized::QMatMul;
+use candle_core::{DType, Device, Result, Tensor, D};
+use candle_nn::{Embedding, Module};
+use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 
 use crate::attention::SdpaParams;
 use crate::device_map::DeviceMapper;
@@ -15,10 +28,8 @@ use crate::pipeline::{extract_logits, EitherCache, KvCache, NormalCache};
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
-use candle_core::quantized::QMatMul;
-use candle_core::{DType, Device, Result, Tensor, D};
-use candle_nn::{Embedding, Module};
-use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
+
+use super::quantized_qwen3_vl_vision::{QQwen3VLVisionEncoder, Qwen3VLVisionConfig};
 
 // Default fallback for models that don't specify context_length
 const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
@@ -276,7 +287,6 @@ impl LayerWeights {
             }
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
-
                 Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
             }
         };
@@ -292,29 +302,7 @@ impl LayerWeights {
     }
 }
 
-pub struct ModelWeights {
-    tok_embeddings: Embedding,
-    layers: Vec<LayerWeights>,
-    norm: QRmsNorm,
-    output: Arc<dyn QuantMethod>,
-    pub device: Device,
-    pub cache: EitherCache,
-    pub max_seq_len: usize,
-    mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
-    dtype: DType,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct QwenMoEConfig {
-    pub moe_intermediate_size: usize,
-    pub num_experts: Option<usize>,
-    pub mlp_only_layers: Option<Vec<usize>>,
-    pub decoder_sparse_step: Option<usize>,
-    pub norm_topk_prob: bool,
-    pub num_experts_per_tok: usize,
-}
-
+// Qwen3-VL MoE LLM config extracted from GGUF metadata
 pub(crate) struct PropsGGUF {
     pub head_count: usize,
     pub head_count_kv: usize,
@@ -325,10 +313,12 @@ pub(crate) struct PropsGGUF {
     pub rope_freq_base: f32,
     pub key_length: usize,
     pub value_length: usize,
-    pub moe_cfg: QwenMoEConfig,
+    // MoE config
+    pub num_experts: Option<usize>,
+    pub num_experts_per_tok: usize,
 }
 
-fn verify_qwen3_arch(
+fn verify_qwen3vlmoe_arch(
     metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>,
 ) -> Result<String> {
     use crate::utils::gguf_metadata::TryValueInto;
@@ -337,8 +327,9 @@ fn verify_qwen3_arch(
         .cloned()
         .try_value_into()?;
 
-    if actual_arch != "qwen3" && actual_arch != "qwen3moe" {
-        candle_core::bail!("Expected `qwen3` architecture, got `{actual_arch}`.");
+    // Only accept qwen3vlmoe architecture
+    if actual_arch != "qwen3vlmoe" {
+        candle_core::bail!("Expected `qwen3vlmoe` architecture, got `{actual_arch}`.");
     }
     Ok(actual_arch)
 }
@@ -347,7 +338,7 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
     type Error = anyhow::Error;
 
     fn try_from(c: ContentMetadata) -> std::result::Result<Self, Self::Error> {
-        let _ = verify_qwen3_arch(c.metadata)?;
+        let _ = verify_qwen3vlmoe_arch(c.metadata)?;
 
         let required = [
             "attention.head_count",
@@ -360,18 +351,6 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
 
         let embed_len = c.get_value::<u32>("embedding_length")? as usize;
         let head_count = c.get_value::<u32>("attention.head_count")? as usize;
-
-        // NOTE: Values are not aligned with GGUFv3 types
-        // TODO: Normalize value types to spec
-
-        let moe_cfg = QwenMoEConfig {
-            moe_intermediate_size: c.get_value::<u32>("expert_feed_forward_length")? as usize,
-            num_experts: Some(c.get_value::<u32>("expert_count")? as usize),
-            mlp_only_layers: Some(vec![]),
-            decoder_sparse_step: Some(1),
-            norm_topk_prob: true,
-            num_experts_per_tok: c.get_value::<u32>("expert_used_count")? as usize,
-        };
 
         let props = Self {
             head_count,
@@ -394,11 +373,30 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
                 .ok()
                 .map(|x| x as usize)
                 .unwrap_or(embed_len / head_count),
-            moe_cfg,
+            // MoE config
+            num_experts: Some(c.get_value::<u32>("expert_count")? as usize),
+            num_experts_per_tok: c.get_value::<u32>("expert_used_count")? as usize,
         };
 
         Ok(props)
     }
+}
+
+/// Combined Qwen3-VL MoE model with LLM text weights (MoE layers) and vision encoder.
+pub struct ModelWeights {
+    tok_embeddings: Embedding,
+    layers: Vec<LayerWeights>,
+    norm: QRmsNorm,
+    output: Arc<dyn QuantMethod>,
+    pub device: Device,
+    pub cache: EitherCache,
+    pub max_seq_len: usize,
+    mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
+    dtype: DType,
+    // Vision encoder from mmproj (None if not loaded yet)
+    vision_encoder: Option<QQwen3VLVisionEncoder>,
+    // Vision config (stored for reference)
+    vision_config: Option<Qwen3VLVisionConfig>,
 }
 
 impl ModelConfig::FromGGUF for ModelWeights {
@@ -409,9 +407,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
     ) -> Result<Self> {
-        // Parameter extraction from metadata.
         let meta = ct.get_metadata();
-        let actual_arch = verify_qwen3_arch(meta)?;
+        let actual_arch = verify_qwen3vlmoe_arch(meta)?;
 
         let metadata = ContentMetadata {
             path_prefix: &actual_arch,
@@ -427,8 +424,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
             rope_freq_base,
             key_length,
             value_length,
-            moe_cfg,
+            num_experts,
+            num_experts_per_tok,
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
+
+        tracing::info!(
+            "Loading Qwen3-VL MoE model: {} layers, {} experts, {} experts/token",
+            block_count,
+            num_experts.unwrap_or(0),
+            num_experts_per_tok
+        );
 
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
         let tok_embeddings = qtok_embeddings.dequantize(device)?;
@@ -463,6 +468,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             );
         }
 
+        // MoE config for determining layer type
+        let moe_num_experts = num_experts.unwrap_or(0);
+
         for layer_idx in NiceProgressBar::<_, 'b'>(
             0..block_count,
             "Loading repeating layers",
@@ -480,34 +488,32 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let attention_wv = ct.tensor(&format!("{prefix}.attn_v.weight"), device)?;
             let attention_wo = ct.tensor(&format!("{prefix}.attn_output.weight"), device)?;
 
-            let mlp = if !moe_cfg
-                .mlp_only_layers
-                .as_ref()
-                .unwrap()
-                .contains(&layer_idx)
-                && (moe_cfg.num_experts.unwrap() > 0
-                    && (layer_idx + 1) % moe_cfg.decoder_sparse_step.unwrap() == 0)
+            // Check if this layer has MoE experts
+            let mlp = if ct.has_tensor(&format!("{prefix}.ffn_gate_exps.weight"))
+                && (moe_num_experts > 0)
             {
+                // Load MoE layer
                 let gate = ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
                 let gate_experts = ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device)?;
                 let up_experts = ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?;
                 let down_experts = ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?;
-                let moe = FusedMoe::new(
+
+                MoeOrMlp::FusedMoe(FusedMoe::new(
                     QMatMul::from_qtensor(gate)?,
                     QMatMul::from_qtensor(gate_experts)?,
                     QMatMul::from_qtensor(up_experts)?,
                     QMatMul::from_qtensor(down_experts)?,
-                    moe_cfg.norm_topk_prob,
-                    moe_cfg.num_experts_per_tok,
+                    true, // norm_topk_prob
+                    num_experts_per_tok,
                     device,
-                )?;
-
-                MoeOrMlp::FusedMoe(moe)
+                )?)
             } else {
+                // Load dense MLP (fallback for non-MoE layers if any)
                 let feed_forward_w1 = ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
                 let feed_forward_w2 = ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
                 let feed_forward_w3 = ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
-                let mlp = Mlp {
+
+                MoeOrMlp::Mlp(Mlp {
                     feed_forward_w1: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                         q_weight: Arc::new(feed_forward_w1),
                         b: None,
@@ -520,8 +526,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                         q_weight: Arc::new(feed_forward_w3),
                         b: None,
                     })?),
-                };
-                MoeOrMlp::Mlp(mlp)
+                })
             };
 
             // Qwen3 always has q_norm and k_norm
@@ -578,6 +583,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 dtype,
             })
         }
+
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
             layers,
@@ -591,11 +597,31 @@ impl ModelConfig::FromGGUF for ModelWeights {
             max_seq_len,
             mapper: Some(mapper),
             dtype,
+            vision_encoder: None,
+            vision_config: None,
         })
     }
 }
 
 impl ModelWeights {
+    /// Set the vision encoder after loading the LLM.
+    pub fn set_vision_encoder(&mut self, encoder: QQwen3VLVisionEncoder) {
+        self.vision_config = Some(encoder.config().clone());
+        self.vision_encoder = Some(encoder);
+    }
+
+    /// Check if vision encoder is loaded.
+    pub fn has_vision(&self) -> bool {
+        self.vision_encoder.is_some()
+    }
+
+    /// Get vision config (if loaded).
+    pub fn vision_config(&self) -> Option<&Qwen3VLVisionConfig> {
+        self.vision_config.as_ref()
+    }
+
+    /// Text-only forward pass (no vision inputs).
+    /// For vision support, use `forward_with_vision` instead.
     pub fn forward(
         &self,
         x: &Tensor,
@@ -640,7 +666,7 @@ impl ModelWeights {
             )?;
             let x = (attn + residual)?;
 
-            // MLP
+            // MLP or MoE
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp.forward(&x)?;
@@ -648,9 +674,120 @@ impl ModelWeights {
             layer_in = x;
         }
         let x = self.norm.forward(&layer_in)?;
-        extract_logits(
-            &MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?,
-            context_lens,
-        )
+        let logits = MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?;
+        // Convert to F32 for sampler compatibility (avoids dtype mismatch in where_cond)
+        let logits = logits.to_dtype(DType::F32)?;
+        extract_logits(&logits, context_lens)
+    }
+
+    /// Forward pass with vision support.
+    /// This processes images through the vision encoder and injects embeddings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_vision(
+        &self,
+        input_ids: &Tensor,
+        pixel_values: Option<&Tensor>,
+        image_grid_thw: Option<&Tensor>,
+        image_positions: &[(usize, usize, usize)], // (batch_idx, start, end)
+        start_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        // Start with text token embeddings (keep F32 for CPU compatibility)
+        let mut input_embeds = self.tok_embeddings.forward(input_ids)?;
+        let (batch_size, seq_len, hidden_dim) = input_embeds.dims3()?;
+
+        // If we have pixel values and a vision encoder, process images
+        if let (Some(pixel_values), Some(grid_thw), Some(vision_encoder)) =
+            (pixel_values, image_grid_thw, &self.vision_encoder)
+        {
+            // Debug: log tensor shapes
+            tracing::info!(
+                "Vision encoder input shapes - pixel_values: {:?}, grid_thw: {:?}",
+                pixel_values.dims(),
+                grid_thw.dims()
+            );
+
+            // Process images through vision encoder
+            let (image_embeds, _deepstack_features) = vision_encoder.forward(pixel_values, grid_thw)?;
+            // Convert to same dtype as input_embeds for compatibility
+            let image_embeds = image_embeds.to_dtype(input_embeds.dtype())?;
+
+            // Inject image embeddings at placeholder positions
+            let mut offset = 0usize;
+            for &(batch_idx, start, end) in image_positions {
+                let len = end - start;
+                if offset + len > image_embeds.dim(0)? {
+                    candle_core::bail!(
+                        "Image embedding length {} insufficient for placeholder span {} (need {} more)",
+                        image_embeds.dim(0)?,
+                        len,
+                        offset + len - image_embeds.dim(0)?
+                    );
+                }
+
+                let chunk = image_embeds.narrow(0, offset, len)?;
+                offset += len;
+
+                // Replace placeholder tokens with image embeddings
+                input_embeds = input_embeds.slice_assign(
+                    &[batch_idx..batch_idx + 1, start..end, 0..hidden_dim],
+                    &chunk.unsqueeze(0)?,
+                )?;
+            }
+        }
+
+        // Now run through the text model transformer
+        let cache = &mut self.cache.normal().0;
+        let mask = CausalMasker.make_causal_mask_matrix(
+            input_ids,
+            metadata
+                .as_ref()
+                .map(|(_, _)| &start_offsets as &dyn PastKvLenCache)
+                .unwrap_or(cache as &dyn PastKvLenCache),
+            self.dtype,
+            self.layers[0].n_head,
+        )?;
+        let mask = mask.filter(|_| {
+            metadata
+                .as_ref()
+                .map(|(_, meta)| meta.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        let mut layer_in = input_embeds;
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(ref mapper) = self.mapper {
+                layer_in = mapper.map(layer_in, i)?;
+            }
+            let x = layer_in;
+            let residual = &x;
+            let x = layer.attention_norm.forward(&x)?;
+            let attn = layer.forward_attn(
+                &x,
+                mask.as_ref()
+                    .map(|m| m.to_device(x.device()).unwrap())
+                    .as_ref(),
+                start_offsets,
+                &mut cache[i],
+                metadata
+                    .as_ref()
+                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+            )?;
+            let x = (attn + residual)?;
+
+            // MLP or MoE
+            let residual = &x;
+            let x = layer.ffn_norm.forward(&x)?;
+            let x = layer.mlp.forward(&x)?;
+            let x = (x + residual)?;
+            layer_in = x;
+        }
+
+        let x = self.norm.forward(&layer_in)?;
+        let logits = MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?;
+        // Convert to F32 for sampler compatibility (avoids dtype mismatch in where_cond)
+        let logits = logits.to_dtype(DType::F32)?;
+        extract_logits(&logits, context_lens)
     }
 }
