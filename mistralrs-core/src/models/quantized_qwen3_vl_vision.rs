@@ -181,17 +181,9 @@ impl QVisionAttention {
         let k = qkv.i(1)?.squeeze(0)?;
         let v = qkv.i(2)?.squeeze(0)?;
 
-        // Apply rotary position embedding (RoPE needs F32 for numerical stability)
-        // Only convert Q/K for RoPE, keep V in native dtype for SDPA
-        let (q, k) = {
-            let cos_f32 = if cos.dtype() == DType::F32 { cos.clone() } else { cos.to_dtype(DType::F32)? };
-            let sin_f32 = if sin.dtype() == DType::F32 { sin.clone() } else { sin.to_dtype(DType::F32)? };
-            let q_f32 = if q.dtype() == DType::F32 { q.clone() } else { q.to_dtype(DType::F32)? };
-            let k_f32 = if k.dtype() == DType::F32 { k.clone() } else { k.to_dtype(DType::F32)? };
-            let (q_rot, k_rot) = apply_rotary_pos_emb_vision(&q_f32, &k_f32, &cos_f32, &sin_f32)?;
-            // Convert back to input dtype for SDPA (which supports BF16/F16 natively)
-            (q_rot.to_dtype(input_dtype)?, k_rot.to_dtype(input_dtype)?)
-        };
+        // Apply rotary position embedding
+        // OPTIMIZED: RoPE in native dtype (F16/BF16) - Metal supports all ops
+        let (q, k) = apply_rotary_pos_emb_vision(&q, &k, cos, sin)?;
 
         // Process each sequence in the batch
         // Note: Q, K now in input_dtype after RoPE; V stays in original dtype from QKV projection
@@ -958,13 +950,15 @@ impl QQwen3VLVisionEncoder {
         let mut hidden_states = xs.add(&pos_embeds)?;
 
         // 3. Rotary position embedding for attention
+        // OPTIMIZED: Keep cos/sin in native dtype - Metal supports F16/BF16 for all RoPE ops
         let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
         let seq_len = hidden_states.dim(0)?;
         let head_dim = self.config.embedding_length / self.config.num_heads;
         let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, head_dim))?;
         // cos/sin shape should be [seq_len, head_dim] to match q/k [seq_len, num_heads, head_dim]
-        let cos = rotary_pos_emb.cos()?.to_dtype(DType::F32)?;
-        let sin = rotary_pos_emb.sin()?.to_dtype(DType::F32)?;
+        // Keep in hidden_states dtype (F16) - no F32 conversion needed
+        let cos = rotary_pos_emb.cos()?.to_dtype(hidden_states.dtype())?;
+        let sin = rotary_pos_emb.sin()?.to_dtype(hidden_states.dtype())?;
 
         // 4. Build cumulative sequence lengths
         let cu_seqlens = self.build_cu_seqlens(grid_thw)?;
