@@ -62,7 +62,7 @@ impl Qwen3VLModel {
         }
         let text = Qwen3VLTextModel::new(
             &text_config,
-            vb.clone(),
+            vb, // No clone needed - vb not used after this
             cfg.tie_word_embeddings,
             normal_loading_metadata,
             attention_mechanism,
@@ -428,13 +428,19 @@ impl Qwen3VLModel {
             let Some(image_grid_thw_ref) = image_grid_thw.as_ref() else {
                 candle_core::bail!("pixel_values require image_grid_thw");
             };
-            let mut pixel_values = pixel_values.clone();
-            let dims = pixel_values.dims();
-            if dims.len() == 3 {
-                pixel_values = pixel_values.reshape((dims[0] * dims[1], dims[2]))?;
-            }
+            // Avoid clone: reshape creates a new tensor, so only clone if no reshape needed
+            let pixel_values_reshaped;
+            let pixel_values_input = {
+                let dims = pixel_values.dims();
+                if dims.len() == 3 {
+                    pixel_values_reshaped = pixel_values.reshape((dims[0] * dims[1], dims[2]))?;
+                    &pixel_values_reshaped
+                } else {
+                    pixel_values
+                }
+            };
             let (image_embeds, deepstack_image_embeds) =
-                self.vision.forward(&pixel_values, image_grid_thw_ref)?;
+                self.vision.forward(pixel_values_input, image_grid_thw_ref)?;
             let image_embeds = image_embeds.to_device(&device)?.to_dtype(self.text.dtype)?;
             let deepstack_image_embeds = deepstack_image_embeds
                 .into_iter()
@@ -477,13 +483,20 @@ impl Qwen3VLModel {
             let Some(video_grid_thw_ref) = video_grid_thw.as_ref() else {
                 candle_core::bail!("pixel_values_videos require video_grid_thw");
             };
-            let mut pixel_values = pixel_values_videos.clone();
-            let dims = pixel_values.dims();
-            if dims.len() == 3 {
-                pixel_values = pixel_values.reshape((dims[0] * dims[1], dims[2]))?;
-            }
+            // Avoid clone: reshape creates a new tensor, so only clone if no reshape needed
+            let video_values_reshaped;
+            let video_values_input = {
+                let dims = pixel_values_videos.dims();
+                if dims.len() == 3 {
+                    video_values_reshaped =
+                        pixel_values_videos.reshape((dims[0] * dims[1], dims[2]))?;
+                    &video_values_reshaped
+                } else {
+                    pixel_values_videos
+                }
+            };
             let (video_embeds, deepstack_video_embeds) =
-                self.vision.forward(&pixel_values, video_grid_thw_ref)?;
+                self.vision.forward(video_values_input, video_grid_thw_ref)?;
             let video_embeds = video_embeds.to_device(&device)?.to_dtype(self.text.dtype)?;
             let deepstack_video_embeds = deepstack_video_embeds
                 .into_iter()
