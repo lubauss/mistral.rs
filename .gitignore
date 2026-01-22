@@ -5,4 +5,4 @@
 .DS_Store
 .idea
 mistral.rs/
-mistralrs-web-chat/cache
+mistralrs-web-chat/cache*.gguf
