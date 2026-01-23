@@ -168,6 +168,17 @@ impl VisionAttention {
 
         // OPTIMIZED: Fast path for single sequence (99% of inference cases)
         // Avoids Vec allocation, loop overhead, and Tensor::cat
+        let debug = std::env::var("MISTRALRS_DEBUG_ATTN").is_ok();
+
+        if debug {
+            let q_f32 = q.to_dtype(candle_core::DType::F32)?;
+            let k_f32 = k.to_dtype(candle_core::DType::F32)?;
+            let v_f32 = v.to_dtype(candle_core::DType::F32)?;
+            eprintln!("[DEBUG HF ATTN] After RoPE - Q: mean={:.6}, std={:.6}", q_f32.mean_all()?.to_scalar::<f32>()?, q_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+            eprintln!("[DEBUG HF ATTN] After RoPE - K: mean={:.6}, std={:.6}", k_f32.mean_all()?.to_scalar::<f32>()?, k_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+            eprintln!("[DEBUG HF ATTN] V: mean={:.6}, std={:.6}", v_f32.mean_all()?.to_scalar::<f32>()?, v_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+        }
+
         let attn_output = if cu_seqlens.len() == 2 {
             // Single sequence - process directly without loop
             let q_t = q.transpose(0, 1)?.unsqueeze(0)?;
@@ -229,7 +240,20 @@ impl VisionAttention {
             }
             Tensor::cat(&outputs, 0)?
         };
-        self.proj.forward(&attn_output)
+
+        if debug {
+            let a_f32 = attn_output.to_dtype(candle_core::DType::F32)?;
+            eprintln!("[DEBUG HF ATTN] SDPA output: mean={:.6}, std={:.6}", a_f32.mean_all()?.to_scalar::<f32>()?, a_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+        }
+
+        let output = self.proj.forward(&attn_output)?;
+
+        if debug {
+            let o_f32 = output.to_dtype(candle_core::DType::F32)?;
+            eprintln!("[DEBUG HF ATTN] Proj output: mean={:.6}, std={:.6}", o_f32.mean_all()?.to_scalar::<f32>()?, o_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+        }
+
+        Ok(output)
     }
 
     fn residual_tensors(&self) -> Vec<(String, Tensor)> {
@@ -282,6 +306,67 @@ impl VisionBlock {
         let xs_att = xs.add(&attn_out)?;
         let mlp_out = self.mlp.forward(&self.norm2.forward(&xs_att)?)?;
         xs_att.add(&mlp_out)
+    }
+
+    #[allow(dead_code)]
+    fn forward_debug(
+        &self,
+        xs: &Tensor,
+        cu_seqlens: &[usize],
+        cos: &Tensor,
+        sin: &Tensor,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let debug = std::env::var("MISTRALRS_DEBUG_VISION_BLOCKS").is_ok() && layer_idx == 0;
+
+        if debug {
+            let xs_f32 = xs.to_dtype(candle_core::DType::F32)?;
+            let xs_mean = xs_f32.mean_all()?.to_scalar::<f32>()?;
+            let xs_std = xs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG HF BLOCK {}] Input: mean={:.6}, std={:.6}", layer_idx, xs_mean, xs_std);
+        }
+
+        let normed = self.norm1.forward(xs)?;
+        if debug {
+            let n_f32 = normed.to_dtype(candle_core::DType::F32)?;
+            let n_mean = n_f32.mean_all()?.to_scalar::<f32>()?;
+            let n_std = n_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG HF BLOCK {}] After LN1: mean={:.6}, std={:.6}", layer_idx, n_mean, n_std);
+        }
+
+        let attn_out = self.attn.forward(&normed, cu_seqlens, cos, sin)?;
+        if debug {
+            let a_f32 = attn_out.to_dtype(candle_core::DType::F32)?;
+            let a_mean = a_f32.mean_all()?.to_scalar::<f32>()?;
+            let a_std = a_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG HF BLOCK {}] Attn output: mean={:.6}, std={:.6}", layer_idx, a_mean, a_std);
+        }
+
+        let xs_att = xs.add(&attn_out)?;
+        if debug {
+            let xs_f32 = xs_att.to_dtype(candle_core::DType::F32)?;
+            let xs_mean = xs_f32.mean_all()?.to_scalar::<f32>()?;
+            let xs_std = xs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG HF BLOCK {}] After attn residual: mean={:.6}, std={:.6}", layer_idx, xs_mean, xs_std);
+        }
+
+        let mlp_out = self.mlp.forward(&self.norm2.forward(&xs_att)?)?;
+        if debug {
+            let m_f32 = mlp_out.to_dtype(candle_core::DType::F32)?;
+            let m_mean = m_f32.mean_all()?.to_scalar::<f32>()?;
+            let m_std = m_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG HF BLOCK {}] MLP output: mean={:.6}, std={:.6}", layer_idx, m_mean, m_std);
+        }
+
+        let result = xs_att.add(&mlp_out)?;
+        if debug {
+            let r_f32 = result.to_dtype(candle_core::DType::F32)?;
+            let r_mean = r_f32.mean_all()?.to_scalar::<f32>()?;
+            let r_std = r_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG HF BLOCK {}] Output: mean={:.6}, std={:.6}", layer_idx, r_mean, r_std);
+        }
+
+        Ok(result)
     }
 
     fn residual_tensors(&self) -> Vec<(String, Tensor)> {
@@ -640,8 +725,29 @@ impl Qwen3VLVisionModel {
     }
 
     pub fn forward(&self, xs: &Tensor, grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        let debug = std::env::var("MISTRALRS_DEBUG_VISION").is_ok();
+
+        if debug {
+            let xs_f32 = xs.to_dtype(candle_core::DType::F32)?;
+            let xs_mean = xs_f32.mean_all()?.to_scalar::<f32>()?;
+            let xs_var = xs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG HF] Vision encoder INPUT:");
+            eprintln!("  xs shape: {:?}, dtype: {:?}", xs.dims(), xs.dtype());
+            eprintln!("  xs mean: {:.6}, std: {:.6}", xs_mean, xs_var.sqrt());
+            let first_vals: Vec<f32> = xs_f32.flatten_all()?.narrow(0, 0, 10.min(xs_f32.elem_count()))?.to_vec1()?;
+            eprintln!("  xs first 10 values: {:?}", first_vals);
+        }
+
         let dtype = self.pos_embed.embeddings().dtype();
         let xs = self.patch_embed.forward(&xs.to_dtype(dtype)?)?;
+
+        if debug {
+            let xs_f32 = xs.to_dtype(candle_core::DType::F32)?;
+            let xs_mean = xs_f32.mean_all()?.to_scalar::<f32>()?;
+            let xs_var = xs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG HF] After patch_embed: shape={:?}, mean={:.6}, std={:.6}", xs.dims(), xs_mean, xs_var.sqrt());
+        }
+
         let pos_embeds = self.fast_pos_embed_interpolate(grid_thw)?;
         let mut hidden_states = xs.add(&pos_embeds)?;
 
@@ -655,16 +761,36 @@ impl Qwen3VLVisionModel {
 
         let cu_seqlens = self.build_cu_seqlens(grid_thw)?;
 
+        let debug_blocks = std::env::var("MISTRALRS_DEBUG_VISION_BLOCKS").is_ok();
         let mut deepstack_features = Vec::new();
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            hidden_states = block.forward(&hidden_states, &cu_seqlens, &cos, &sin)?;
+            if debug_blocks && layer_idx == 0 {
+                hidden_states = block.forward_debug(&hidden_states, &cu_seqlens, &cos, &sin, layer_idx)?;
+            } else {
+                hidden_states = block.forward(&hidden_states, &cu_seqlens, &cos, &sin)?;
+            }
             if let Some(merger_idx) = self.deepstack_lookup[layer_idx] {
                 let feat = self.deepstack_mergers[merger_idx].forward(&hidden_states)?;
                 deepstack_features.push(feat);
             }
         }
 
+        if debug {
+            let hs_f32 = hidden_states.to_dtype(candle_core::DType::F32)?;
+            let hs_mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
+            let hs_var = hs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG HF] After transformer_blocks: shape={:?}, mean={:.6}, std={:.6}", hidden_states.dims(), hs_mean, hs_var.sqrt());
+        }
+
         let hidden_states = self.merger.forward(&hidden_states)?;
+
+        if debug {
+            let hs_f32 = hidden_states.to_dtype(candle_core::DType::F32)?;
+            let hs_mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
+            let hs_var = hs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG HF] After merger (FINAL): shape={:?}, mean={:.6}, std={:.6}", hidden_states.dims(), hs_mean, hs_var.sqrt());
+        }
+
         Ok((hidden_states, deepstack_features))
     }
 
