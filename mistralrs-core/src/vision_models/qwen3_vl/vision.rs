@@ -134,12 +134,41 @@ struct VisionAttention {
 
 impl VisionAttention {
     fn new(dim: usize, num_heads: usize, vb: ShardedVarBuilder) -> Result<Self> {
+        let qkv = layers::linear(dim, dim * 3, vb.pp("qkv"))?;
+        let proj = layers::linear(dim, dim, vb.pp("proj"))?;
+
         Ok(Self {
-            qkv: layers::linear(dim, dim * 3, vb.pp("qkv"))?,
-            proj: layers::linear(dim, dim, vb.pp("proj"))?,
+            qkv,
+            proj,
             num_heads,
             head_dim: dim / num_heads,
         })
+    }
+
+    /// Debug: Print projection weight statistics (call once per model for block 0)
+    #[allow(dead_code)]
+    fn debug_weights(&self, prefix: &str) -> Result<()> {
+        let proj_weight = self.proj.weight();
+        let proj_f32 = proj_weight.to_dtype(candle_core::DType::F32)?;
+        let proj_mean = proj_f32.mean_all()?.to_scalar::<f32>()?;
+        let proj_var = proj_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+        let proj_min = proj_f32.flatten_all()?.min(0)?.to_scalar::<f32>()?;
+        let proj_max = proj_f32.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        eprintln!("[DEBUG HF WEIGHTS] {}.proj.weight:", prefix);
+        eprintln!("  shape: {:?}, dtype: {:?}", proj_weight.dims(), proj_weight.dtype());
+        eprintln!("  mean={:.6}, std={:.6}, min={:.6}, max={:.6}", proj_mean, proj_var.sqrt(), proj_min, proj_max);
+
+        if let Some(bias) = self.proj.bias() {
+            let bias_f32 = bias.to_dtype(candle_core::DType::F32)?;
+            let bias_mean = bias_f32.mean_all()?.to_scalar::<f32>()?;
+            let bias_var = bias_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG HF WEIGHTS] {}.proj.bias:", prefix);
+            eprintln!("  shape: {:?}, mean={:.6}, std={:.6}", bias.dims(), bias_mean, bias_var.sqrt());
+        } else {
+            eprintln!("[DEBUG HF WEIGHTS] {}.proj.bias: NONE", prefix);
+        }
+
+        Ok(())
     }
 
     fn forward(
@@ -267,12 +296,12 @@ impl VisionAttention {
 struct VisionBlock {
     norm1: LayerNorm,
     norm2: LayerNorm,
-    attn: VisionAttention,
+    pub(crate) attn: VisionAttention,  // pub(crate) for debug_weights access
     mlp: VisionMlp,
 }
 
 impl VisionBlock {
-    fn new(cfg: &VisionConfig, vb: ShardedVarBuilder) -> Result<Self> {
+    fn new(cfg: &VisionConfig, vb: ShardedVarBuilder, layer_idx: usize) -> Result<Self> {
         let norm_cfg = LayerNormConfig {
             eps: 1e-6,
             ..Default::default()
@@ -286,6 +315,14 @@ impl VisionBlock {
             cfg.hidden_act,
             vb.pp("mlp"),
         )?;
+
+        // Debug: Print block 0 attention projection weights at load time
+        if layer_idx == 0 && std::env::var("MISTRALRS_DEBUG_WEIGHTS").is_ok() {
+            if let Err(e) = attn.debug_weights(&format!("blocks.{}.attn", layer_idx)) {
+                tracing::warn!("Failed to debug weights: {}", e);
+            }
+        }
+
         Ok(Self {
             norm1,
             norm2,
@@ -496,7 +533,7 @@ impl Qwen3VLVisionModel {
 
         let mut blocks = Vec::with_capacity(cfg.depth);
         for i in 0..cfg.depth {
-            blocks.push(VisionBlock::new(cfg, vb.pp(format!("blocks.{i}")))?);
+            blocks.push(VisionBlock::new(cfg, vb.pp(format!("blocks.{i}")), i)?);
         }
 
         let merger = PatchMerger::new(cfg, false, vb.pp("merger"))?;

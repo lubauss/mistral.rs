@@ -133,6 +133,8 @@ impl QVisionAttention {
         cfg: &Qwen3VLVisionConfig,
         device: &Device,
     ) -> Result<Self> {
+        let debug_weights = std::env::var("MISTRALRS_DEBUG_WEIGHTS").is_ok();
+
         let qkv_weight = ct.tensor(&format!("{prefix}.attn_qkv.weight"), device)?;
         let qkv_bias = ct.tensor(&format!("{prefix}.attn_qkv.bias"), device)
             .ok()
@@ -144,6 +146,29 @@ impl QVisionAttention {
             .ok()
             .map(|t| t.dequantize(device))
             .transpose()?;
+
+        // Debug: Print projection weight statistics for block 0
+        if debug_weights && prefix == "v.blk.0" {
+            let proj_dequant = proj_weight.dequantize(device)?;
+            let proj_f32 = proj_dequant.to_dtype(candle_core::DType::F32)?;
+            let proj_mean = proj_f32.mean_all()?.to_scalar::<f32>()?;
+            let proj_var = proj_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+            let proj_min = proj_f32.flatten_all()?.min(0)?.to_scalar::<f32>()?;
+            let proj_max = proj_f32.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            eprintln!("[DEBUG GGUF WEIGHTS] {}.attn_out.weight:", prefix);
+            eprintln!("  shape: {:?}, dtype: {:?}", proj_dequant.dims(), proj_dequant.dtype());
+            eprintln!("  mean={:.6}, std={:.6}, min={:.6}, max={:.6}", proj_mean, proj_var.sqrt(), proj_min, proj_max);
+
+            if let Some(ref bias) = proj_bias {
+                let bias_f32 = bias.to_dtype(candle_core::DType::F32)?;
+                let bias_mean = bias_f32.mean_all()?.to_scalar::<f32>()?;
+                let bias_var = bias_f32.var(0)?.mean_all()?.to_scalar::<f32>()?;
+                eprintln!("[DEBUG GGUF WEIGHTS] {}.attn_out.bias:", prefix);
+                eprintln!("  shape: {:?}, mean={:.6}, std={:.6}", bias.dims(), bias_mean, bias_var.sqrt());
+            } else {
+                eprintln!("[DEBUG GGUF WEIGHTS] {}.attn_out.bias: NONE", prefix);
+            }
+        }
 
         let head_dim = cfg.embedding_length / cfg.num_heads;
 
