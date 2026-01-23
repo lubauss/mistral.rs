@@ -170,8 +170,16 @@ impl QVisionAttention {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        let debug = std::env::var("MISTRALRS_DEBUG_ATTN").is_ok();
         let seq_len = xs.dim(0)?;
         let hidden_states = self.qkv.forward(xs)?;
+
+        if debug {
+            let h_f32 = hidden_states.to_dtype(candle_core::DType::F32)?;
+            let h_mean = h_f32.mean_all()?.to_scalar::<f32>()?;
+            let h_std = h_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG ATTN] QKV output: mean={:.6}, std={:.6}", h_mean, h_std);
+        }
 
         let qkv = hidden_states
             .reshape((seq_len, 3, self.num_heads, self.head_dim))?
@@ -180,9 +188,25 @@ impl QVisionAttention {
         let k = qkv.i(1)?.squeeze(0)?;
         let v = qkv.i(2)?.squeeze(0)?;
 
+        if debug {
+            let q_f32 = q.to_dtype(candle_core::DType::F32)?;
+            let k_f32 = k.to_dtype(candle_core::DType::F32)?;
+            let v_f32 = v.to_dtype(candle_core::DType::F32)?;
+            eprintln!("[DEBUG ATTN] Q: mean={:.6}, std={:.6}", q_f32.mean_all()?.to_scalar::<f32>()?, q_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+            eprintln!("[DEBUG ATTN] K: mean={:.6}, std={:.6}", k_f32.mean_all()?.to_scalar::<f32>()?, k_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+            eprintln!("[DEBUG ATTN] V: mean={:.6}, std={:.6}", v_f32.mean_all()?.to_scalar::<f32>()?, v_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+        }
+
         // Apply rotary position embedding
         // OPTIMIZED: RoPE in native dtype (F16/BF16) - Metal supports all ops
         let (q, k) = apply_rotary_pos_emb_vision(&q, &k, cos, sin)?;
+
+        if debug {
+            let q_f32 = q.to_dtype(candle_core::DType::F32)?;
+            let k_f32 = k.to_dtype(candle_core::DType::F32)?;
+            eprintln!("[DEBUG ATTN] After RoPE - Q: mean={:.6}, std={:.6}", q_f32.mean_all()?.to_scalar::<f32>()?, q_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+            eprintln!("[DEBUG ATTN] After RoPE - K: mean={:.6}, std={:.6}", k_f32.mean_all()?.to_scalar::<f32>()?, k_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+        }
 
         let sdpa_params = SdpaParams {
             n_kv_groups: 1,
@@ -232,7 +256,19 @@ impl QVisionAttention {
             Tensor::cat(&outputs, 0)?
         };
 
-        self.proj.forward(&attn_output)
+        if debug {
+            let a_f32 = attn_output.to_dtype(candle_core::DType::F32)?;
+            eprintln!("[DEBUG ATTN] SDPA output: mean={:.6}, std={:.6}", a_f32.mean_all()?.to_scalar::<f32>()?, a_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+        }
+
+        let output = self.proj.forward(&attn_output)?;
+
+        if debug {
+            let o_f32 = output.to_dtype(candle_core::DType::F32)?;
+            eprintln!("[DEBUG ATTN] Proj output: mean={:.6}, std={:.6}", o_f32.mean_all()?.to_scalar::<f32>()?, o_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt());
+        }
+
+        Ok(output)
     }
 }
 
@@ -333,6 +369,68 @@ impl QVisionBlock {
         let normed = self.ln2.forward(&xs)?;
         let mlp_out = self.mlp.forward(&normed)?;
         &xs + mlp_out  // Return reference add to avoid clone
+    }
+
+    #[allow(dead_code)]
+    fn forward_debug(
+        &self,
+        xs: &Tensor,
+        cu_seqlens: &[usize],
+        cos: &Tensor,
+        sin: &Tensor,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let debug = std::env::var("MISTRALRS_DEBUG_VISION_BLOCKS").is_ok() && layer_idx == 0;
+
+        if debug {
+            let xs_f32 = xs.to_dtype(candle_core::DType::F32)?;
+            let xs_mean = xs_f32.mean_all()?.to_scalar::<f32>()?;
+            let xs_std = xs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG BLOCK {}] Input: mean={:.6}, std={:.6}", layer_idx, xs_mean, xs_std);
+        }
+
+        let normed = self.ln1.forward(xs)?;
+        if debug {
+            let n_f32 = normed.to_dtype(candle_core::DType::F32)?;
+            let n_mean = n_f32.mean_all()?.to_scalar::<f32>()?;
+            let n_std = n_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG BLOCK {}] After LN1: mean={:.6}, std={:.6}", layer_idx, n_mean, n_std);
+        }
+
+        let attn_out = self.attn.forward(&normed, cu_seqlens, cos, sin)?;
+        if debug {
+            let a_f32 = attn_out.to_dtype(candle_core::DType::F32)?;
+            let a_mean = a_f32.mean_all()?.to_scalar::<f32>()?;
+            let a_std = a_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG BLOCK {}] Attn output: mean={:.6}, std={:.6}", layer_idx, a_mean, a_std);
+        }
+
+        let xs = (xs + attn_out)?;
+        if debug {
+            let xs_f32 = xs.to_dtype(candle_core::DType::F32)?;
+            let xs_mean = xs_f32.mean_all()?.to_scalar::<f32>()?;
+            let xs_std = xs_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG BLOCK {}] After attn residual: mean={:.6}, std={:.6}", layer_idx, xs_mean, xs_std);
+        }
+
+        let normed = self.ln2.forward(&xs)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        if debug {
+            let m_f32 = mlp_out.to_dtype(candle_core::DType::F32)?;
+            let m_mean = m_f32.mean_all()?.to_scalar::<f32>()?;
+            let m_std = m_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG BLOCK {}] MLP output: mean={:.6}, std={:.6}", layer_idx, m_mean, m_std);
+        }
+
+        let result = (&xs + mlp_out)?;
+        if debug {
+            let r_f32 = result.to_dtype(candle_core::DType::F32)?;
+            let r_mean = r_f32.mean_all()?.to_scalar::<f32>()?;
+            let r_std = r_f32.var(0)?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("[DEBUG BLOCK {}] Output: mean={:.6}, std={:.6}", layer_idx, r_mean, r_std);
+        }
+
+        Ok(result)
     }
 }
 
@@ -970,8 +1068,8 @@ impl QQwen3VLVisionEncoder {
         }
 
         // Reshape input: [num_patches, C*T*H*W] -> [num_patches, C, T, H*W]
-        // Features are in [channel, temporal, h, w] order from preprocessing (C=3, T=2, H=W=16)
-        // The preprocessing permutation puts channel before temporal!
+        // HuggingFace Conv3d expects [N, C, T, H, W] layout, so features should be in [C, T, H, W] order
+        // This matches HuggingFace's reshape(((), in_channels, temporal_patch_size, patch_size, patch_size))
         let xs_reshaped = xs.reshape((num_patches, in_channels, temporal, hw))?;
 
         // Extract temporal slices: [num_patches, C, T, H*W] -> select T dim -> [num_patches, C, H*W] -> flatten to [num_patches, C*H*W]
@@ -987,20 +1085,22 @@ impl QQwen3VLVisionEncoder {
             eprintln!("  xs_t0 shape: {:?}, mean: {:.6}", xs_t0.dims(), t0_mean);
             eprintln!("  xs_t1 shape: {:?}, mean: {:.6}", xs_t1.dims(), t1_mean);
 
-            // Verify: for [C, T, H*W] layout, channel boundaries should be at 256, 512
-            // xs_t0 should have: R[0:256], G[256:512], B[512:768]
+            // Verify: for [T, C, H*W] layout, T=0 slice contains all 3 channels
+            // Original layout: [T0C0, T0C1, T0C2, T1C0, T1C1, T1C2] where each segment is 256 (H*W)
+            // xs_t0 should have: R[0:256], G[256:512], B[512:768] (all from temporal frame 0)
             let xs_orig_f32 = xs.to_dtype(candle_core::DType::F32)?;
             let orig_first = xs_orig_f32.i(0)?.to_vec1::<f32>()?;
             let t0_first = t0_f32.i(0)?.to_vec1::<f32>()?;
 
             // Check if T=0 slice extracts correct positions from original
-            // With [C, T, H*W] layout: C0T0 is [0:256], C0T1 is [256:512], C1T0 is [512:768], etc.
+            // With [T, C, H*W] layout: T0C0 is [0:256], T0C1 is [256:512], T0C2 is [512:768]
+            //                          T1C0 is [768:1024], T1C1 is [1024:1280], T1C2 is [1280:1536]
             eprintln!("  Verification - Original vs T0 extraction:");
-            eprintln!("    orig[0] (C0T0[0])  = {:.6}, t0[0] (should be C0T0[0]) = {:.6}", orig_first[0], t0_first[0]);
-            eprintln!("    orig[256] (C0T1[0]) = {:.6}, t0[256] (should be C1T0[0]) = {:.6}", orig_first[256], t0_first[256]);
-            eprintln!("    orig[512] (C1T0[0]) = {:.6}, t0[512] (should be C2T0[0]) = {:.6}", orig_first[512], t0_first[512]);
-            // C1T0[0] should be at orig position 512, and should appear at t0 position 256
-            eprintln!("    Expected t0[256] = orig[512] = {:.6}", orig_first[512]);
+            eprintln!("    orig[0] (T0C0[0])   = {:.6}, t0[0] (should be T0C0[0])   = {:.6}", orig_first[0], t0_first[0]);
+            eprintln!("    orig[256] (T0C1[0]) = {:.6}, t0[256] (should be T0C1[0]) = {:.6}", orig_first[256], t0_first[256]);
+            eprintln!("    orig[512] (T0C2[0]) = {:.6}, t0[512] (should be T0C2[0]) = {:.6}", orig_first[512], t0_first[512]);
+            // T1C0[0] should be at orig position 768, which is NOT in t0 (t0 only has T=0 data)
+            eprintln!("    orig[768] (T1C0[0]) = {:.6} (should NOT appear in t0)", orig_first[768]);
 
             // Show first patch's values to understand layout
             // xs_t0 has shape [num_patches, C*H*W] = [num_patches, 768]
@@ -1166,9 +1266,14 @@ impl QQwen3VLVisionEncoder {
 
         // 5. Process through transformer blocks with deepstack
         let t0 = std::time::Instant::now();
+        let debug_blocks = std::env::var("MISTRALRS_DEBUG_VISION_BLOCKS").is_ok();
         let mut deepstack_features = Vec::new();
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            hidden_states = block.forward(&hidden_states, &cu_seqlens, &cos, &sin)?;
+            if debug_blocks && layer_idx == 0 {
+                hidden_states = block.forward_debug(&hidden_states, &cu_seqlens, &cos, &sin, layer_idx)?;
+            } else {
+                hidden_states = block.forward(&hidden_states, &cu_seqlens, &cos, &sin)?;
+            }
 
             // Check if this layer has a deepstack merger
             if let Some(deepstack_layer) = self.deepstack.get(&layer_idx) {
