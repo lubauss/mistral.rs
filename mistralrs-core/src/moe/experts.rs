@@ -354,6 +354,17 @@ impl MoEExperts {
         // Prefill = processing multiple tokens; Decode = single token generation
         let is_prefill = seq_len > 1;
 
+        // Debug: trace which backend is being used
+        let backend_name = match &self.backend {
+            MoEExpertsBackendImpl::Fused(_) => "Fused",
+            MoEExpertsBackendImpl::Fast(_) => "Fast",
+            MoEExpertsBackendImpl::Slow(_) => "Slow",
+        };
+        eprintln!(
+            "[DEBUG MoEExperts::forward] backend={} b_size={} seq_len={} hidden_dim={}",
+            backend_name, b_size, seq_len, hidden_dim
+        );
+
         let mut ys = match &self.backend {
             MoEExpertsBackendImpl::Fused(weights) => {
                 self.forward_fused(xs, &topk_weights, topk_ids, weights, is_prefill)?
@@ -471,6 +482,14 @@ impl MoEExperts {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let num_tokens = b_size * seq_len;
 
+        // Debug: trace forward_fast
+        eprintln!(
+            "[DEBUG forward_fast] device={:?} dtype={:?} gate_proj_name={}",
+            xs.device(),
+            original_dtype,
+            weights.fused_gate_proj.name()
+        );
+
         let xs_flat = xs.reshape((num_tokens, hidden_dim))?;
 
         let ys = if xs.device().is_cuda() {
@@ -487,8 +506,17 @@ impl MoEExperts {
                 .gather_forward_autocast(&(up * gate.apply(&self.act)?)?, topk_ids)?
         } else {
             // Metal path: use broadcast gather shapes
+            eprintln!(
+                "[DEBUG forward_fast] Metal path: b_size={} seq_len={} num_experts_per_tok={}",
+                b_size, seq_len, self.num_experts_per_tok
+            );
             let xs = xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?;
             let indices = topk_ids.reshape((b_size, seq_len, self.num_experts_per_tok))?;
+            eprintln!(
+                "[DEBUG forward_fast] xs.shape={:?} indices.shape={:?}",
+                xs.shape(),
+                indices.shape()
+            );
             let gate = weights
                 .fused_gate_proj
                 .gather_forward_autocast(&xs, &indices)?;

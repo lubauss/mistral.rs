@@ -76,6 +76,15 @@ impl QuantMethod for GgufMatMul {
         // - x: (n_tokens, 1, hidden_dim) or (n_tokens, n_experts_per_tok, hidden_dim)
         // - indices: (n_tokens, n_experts_per_tok)
         // - weights (self): (n_experts, out_features, in_features)
+
+        // Debug: trace gather_forward calls
+        eprintln!(
+            "[DEBUG GgufMatMul::gather_forward] x.shape={:?} indices.shape={:?} device={:?}",
+            x.shape(),
+            indices.shape(),
+            x.device()
+        );
+
         #[cfg(feature = "cuda")]
         let res = cuda::qmatmul_indexed_moe_forward(&self.w, x, indices)?;
 
@@ -89,6 +98,7 @@ impl QuantMethod for GgufMatMul {
                 let x_f32 = x.to_dtype(DType::F32)?;
                 // Convert indices to I32 as expected by the kernel
                 let indices_i32 = indices.to_dtype(DType::I32)?;
+                eprintln!("[DEBUG GgufMatMul::gather_forward] calling indexed_moe_forward on Metal");
                 self.w.indexed_moe_forward(&x_f32, &indices_i32)?
             } else {
                 cpu::cpu_indexed_moe_forward(&self.w, x, indices)?
